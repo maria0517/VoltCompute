@@ -495,7 +495,7 @@ def node_ranking(step: int) -> List[Dict[str, Any]]:
 
 def build_offer(steps: List[int]) -> Tuple[Optional[Dict[str, Any]], bool]:
     """
-    Alege oferta curentă: primul data center eligibil (după prioritate) care nu a răspuns încă.
+    Alege oferta curentă: data center-ul cu cea mai mare capacitate disponibilă la primul pas ofertat.
     Returnează (oferta, epuizat). `epuizat=True` înseamnă că a mai rămas surplus necontractat
     și nu mai există niciun data center disponibil căruia să i se trimită oferta.
     """
