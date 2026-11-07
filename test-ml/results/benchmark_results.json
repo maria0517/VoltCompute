@@ -1,0 +1,354 @@
+{
+  "meta": {
+    "generated_at": "2026-11-07T19:25:37",
+    "python": "3.13.14",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "model_path": "C:\\Users\\USER\\Desktop\\aiurea-work\\App\\AI-urea\\model.joblib",
+    "model_version": "v1 (main: model t+2h fără calibrare)",
+    "model_type": "XGBRegressor",
+    "features": [
+      "hour",
+      "dayofweek",
+      "hour_sin",
+      "hour_cos",
+      "temp_c",
+      "radiatie_solara_wm2",
+      "viteza_vant_kmh",
+      "pret_pzu_eur_mwh",
+      "Surplus_National_MW",
+      "surplus_lag_1",
+      "surplus_lag_2",
+      "surplus_lag_24",
+      "temp_lag_1",
+      "radiatie_lag_1",
+      "pret_lag_1"
+    ],
+    "n_features": 15,
+    "dataset_rows": 694,
+    "test_rows": 139,
+    "test_boundary": "2026-05-25T03:00:00",
+    "grid_limit_mw": 0.35,
+    "benchmark_seconds": 1.971450700002606
+  },
+  "artifact_metrics": {
+    "test_mae": 0.006520922601880314,
+    "test_rmse": 0.014082134802991874,
+    "test_r2": 0.9853684027862493
+  },
+  "accuracy": {
+    "2": {
+      "test_rows": 139,
+      "xgboost": {
+        "mae": 0.006497066400691542,
+        "rmse": 0.014081977650730923,
+        "r2": 0.9853687293526094,
+        "bias": -0.0005999874328947611,
+        "max_abs_error": 0.06842511999130252
+      },
+      "baseline_persistence": {
+        "mae": 0.05828489208633093,
+        "rmse": 0.09997342710249911,
+        "r2": 0.2625647344677253,
+        "bias": 7.9872160044975295e-19,
+        "max_abs_error": 0.26278
+      },
+      "baseline_seasonal": {
+        "mae": 0.010565755395683454,
+        "rmse": 0.022385889794031055,
+        "r2": 0.9630254016294786,
+        "bias": -5.2374100719424124e-05,
+        "max_abs_error": 0.09130000000000002
+      },
+      "skill_vs_persistence": 0.888529151069403,
+      "skill_vs_seasonal": 0.3850826412898163,
+      "raw_mae_unclipped": 0.006520922601880314
+    }
+  },
+  "regimes": {
+    "varf_solar_11_15": {
+      "rows": 30,
+      "mean_target_mw": 0.2647406666666667,
+      "xgboost_mae": 0.01850149450302124,
+      "persistence_mae": 0.12951833333333332,
+      "seasonal_mae": 0.033034
+    },
+    "rampe_8_10_16_18": {
+      "rows": 36,
+      "mean_target_mw": 0.05355388888888888,
+      "xgboost_mae": 0.009324754153752389,
+      "persistence_mae": 0.10277222222222221,
+      "seasonal_mae": 0.013228888888888887
+    },
+    "noapte_19_7": {
+      "rows": 73,
+      "mean_target_mw": 9.452054794520548e-06,
+      "xgboost_mae": 0.0001692636311013863,
+      "persistence_mae": 0.0070719178082191796,
+      "seasonal_mae": 1.8904109589041096e-05
+    },
+    "mae_per_target_hour": {
+      "0": 1.8080954760080203e-05,
+      "1": 0.00010844118332897779,
+      "2": 1.2507676729001105e-05,
+      "3": 0.00011425496559240856,
+      "4": 3.677161112136673e-05,
+      "5": 3.149389037086318e-05,
+      "6": 0.00027249664223442477,
+      "7": 0.00024280014836384608,
+      "8": 0.0003193025504766653,
+      "9": 0.004879247424403827,
+      "10": 0.005519266755183538,
+      "11": 0.009682028342088062,
+      "12": 0.01670671687205633,
+      "13": 0.011450019721984858,
+      "14": 0.027004244427680967,
+      "15": 0.027664463151295976,
+      "16": 0.023281999227205915,
+      "17": 0.019094216996431348,
+      "18": 0.002854491968813042,
+      "19": 0.0007960041013189281,
+      "20": 0.0,
+      "21": 6.701565386417012e-05,
+      "22": 2.9458518232180115e-05,
+      "23": 0.00037839156440592586
+    }
+  },
+  "exceedance": {
+    "limita_retea_0.35MW": {
+      "threshold_mw": 0.35,
+      "actual_events": 4,
+      "predicted_events": 3,
+      "precision": 0.3333333333333333,
+      "recall": 0.25,
+      "f1": 0.2857142857142857,
+      "seasonal_baseline_f1": 0.25
+    },
+    "p75_export_pozitiv": {
+      "threshold_mw": 0.28566499999999995,
+      "actual_events": 16,
+      "predicted_events": 12,
+      "precision": 1.0,
+      "recall": 0.75,
+      "f1": 0.8571428571428571,
+      "seasonal_baseline_f1": 0.875
+    }
+  },
+  "uncertainty": {
+    "available": false,
+    "note": "Modelul nu expune interval de predicție / confidență calibrată (lipsește `calibration`)."
+  },
+  "walk_forward": {
+    "folds": [
+      {
+        "fold": 1,
+        "train_rows": 345,
+        "test_rows": 86,
+        "test_start": "2026-05-16T11:00:00",
+        "test_end": "2026-05-20T00:00:00",
+        "xgboost_mae": 0.008820179456749826,
+        "persistence_mae": 0.06191220930232558,
+        "seasonal_mae": 0.010370581395348837,
+        "beats_persistence": true,
+        "beats_seasonal": true
+      },
+      {
+        "fold": 2,
+        "train_rows": 431,
+        "test_rows": 86,
+        "test_start": "2026-05-20T01:00:00",
+        "test_end": "2026-05-23T14:00:00",
+        "xgboost_mae": 0.005692351030948257,
+        "persistence_mae": 0.05980232558139536,
+        "seasonal_mae": 0.007734534883720931,
+        "beats_persistence": true,
+        "beats_seasonal": true
+      },
+      {
+        "fold": 3,
+        "train_rows": 517,
+        "test_rows": 86,
+        "test_start": "2026-05-23T15:00:00",
+        "test_end": "2026-05-27T04:00:00",
+        "xgboost_mae": 0.006047683004296078,
+        "persistence_mae": 0.052595348837209316,
+        "seasonal_mae": 0.006727093023255814,
+        "beats_persistence": true,
+        "beats_seasonal": true
+      },
+      {
+        "fold": 4,
+        "train_rows": 603,
+        "test_rows": 89,
+        "test_start": "2026-05-27T05:00:00",
+        "test_end": "2026-05-30T21:00:00",
+        "xgboost_mae": 0.006290252003801052,
+        "persistence_mae": 0.061288539325842696,
+        "seasonal_mae": 0.012286404494382024,
+        "beats_persistence": true,
+        "beats_seasonal": true
+      }
+    ],
+    "mean_xgboost_mae": 0.006712616373948804,
+    "std_xgboost_mae": 0.0012352420375539575,
+    "mean_persistence_mae": 0.05889960576169324,
+    "mean_seasonal_mae": 0.009279653449176901,
+    "wins_vs_persistence": 4,
+    "wins_vs_seasonal": 4
+  },
+  "robustness": {
+    "baseline_mae": 0.006497066400691542,
+    "weather_noise": {
+      "sigma_5pct": {
+        "mae": 0.006439280930272623,
+        "degradation_pct": -0.8894086477670538
+      },
+      "sigma_10pct": {
+        "mae": 0.006854147921329929,
+        "degradation_pct": 5.496042346133012
+      },
+      "sigma_20pct": {
+        "mae": 0.007454902252455467,
+        "degradation_pct": 14.74258985042811
+      }
+    },
+    "fail_closed": {
+      "valid_input_accepted": true,
+      "missing_feature_rejected": true,
+      "nan_rejected": true,
+      "inf_rejected": true,
+      "out_of_bounds_radiatie_solara_wm2_rejected": true,
+      "out_of_bounds_temp_c_rejected": true,
+      "out_of_bounds_viteza_vant_kmh_rejected": true
+    },
+    "inference_path": "model.predict (nevalidat)"
+  },
+  "feature_importance": {
+    "permutation_mae_increase_mw": {
+      "hour_cos": 0.08002311856468942,
+      "radiatie_solara_wm2": 0.007526783875878004,
+      "hour": 0.004426387701137076,
+      "surplus_lag_24": 0.0021053408907737606,
+      "Surplus_National_MW": 0.0008816756752991374,
+      "temp_c": 0.0007791596018066884,
+      "hour_sin": 0.0007399976327834958,
+      "pret_lag_1": 0.0007202458038328068,
+      "surplus_lag_2": 0.0006690051164855151,
+      "pret_pzu_eur_mwh": 0.0005038479167748218
+    },
+    "treeshap_global_mean_abs_mw": {
+      "hour_cos": 0.07651963829994202,
+      "radiatie_solara_wm2": 0.009938327595591545,
+      "hour": 0.004798085428774357,
+      "surplus_lag_2": 0.0015673339366912842,
+      "pret_pzu_eur_mwh": 0.0013922321377322078,
+      "surplus_lag_24": 0.0012953177792951465,
+      "pret_lag_1": 0.0012713231844827533,
+      "hour_sin": 0.0011226251954212785,
+      "surplus_lag_1": 0.0010861968621611595,
+      "Surplus_National_MW": 0.0008924724534153938
+    }
+  },
+  "performance": {
+    "single_row_predict": {
+      "mean_ms": 1.2640149152040545,
+      "p50_ms": 1.1618000025919173,
+      "p95_ms": 1.2765099982061656,
+      "p99_ms": 1.4160260008065964
+    },
+    "single_row_treeshap": {
+      "mean_ms": 1.6004905084042487,
+      "p50_ms": 1.5798999993421603,
+      "p95_ms": 1.6494199982844293,
+      "p99_ms": 2.286036002478795
+    },
+    "batch_throughput_rows_per_s": 102820.2332443796,
+    "train_seconds_same_config": 0.0657792000019981,
+    "deterministic_retrain_max_abs_diff": 0.0,
+    "artifact_vs_retrain_max_abs_diff": 0.0
+  },
+  "agent_integration": {
+    "model_loaded": false,
+    "uses_ml_model": false,
+    "note": "Agentul nu a încărcat niciun artefact ML."
+  },
+  "checks": [
+    {
+      "check": "Paritate: MAE recalculat independent = MAE raportat în artefact",
+      "value": "0.00e+00",
+      "threshold": "< 1e-6",
+      "passed": true
+    },
+    {
+      "check": "Bate Persistența pe toate orizonturile",
+      "value": "t+2: 89%",
+      "threshold": "skill > 0",
+      "passed": true
+    },
+    {
+      "check": "Bate Baseline-ul Sezonier 24h pe toate orizonturile",
+      "value": "t+2: 39%",
+      "threshold": "skill > 0",
+      "passed": true
+    },
+    {
+      "check": "R² pe test la t+2h",
+      "value": 0.9854,
+      "threshold": "> 0.90",
+      "passed": true
+    },
+    {
+      "check": "Walk-forward: bate Persistența în toate fold-urile",
+      "value": "4/4",
+      "threshold": "toate",
+      "passed": true
+    },
+    {
+      "check": "Walk-forward: bate Sezonierul în majoritatea fold-urilor",
+      "value": "4/4",
+      "threshold": ">= 3/4",
+      "passed": true
+    },
+    {
+      "check": "Incertitudine calibrată (interval + confidență)",
+      "value": "indisponibil",
+      "threshold": "prezent",
+      "passed": null
+    },
+    {
+      "check": "Latență predict 1 rând (p95)",
+      "value": "1.28 ms",
+      "threshold": "< 50 ms",
+      "passed": true
+    },
+    {
+      "check": "Timp antrenare (aceeași configurație)",
+      "value": "0.07 s",
+      "threshold": "< 15 s",
+      "passed": true
+    },
+    {
+      "check": "Reantrenare deterministă",
+      "value": "0.0e+00",
+      "threshold": "== 0",
+      "passed": true
+    },
+    {
+      "check": "Zgomot 10% pe senzorii meteo → degradare MAE",
+      "value": "+5.5%",
+      "threshold": "< 50%",
+      "passed": true
+    },
+    {
+      "check": "Fail-closed pe calea de inferență (NaN / Inf / lipsă / limite fizice)",
+      "value": "7/7",
+      "threshold": "toate",
+      "passed": true
+    },
+    {
+      "check": "Agentul folosește efectiv modelul ML la runtime",
+      "value": null,
+      "threshold": "xgboost",
+      "passed": false
+    }
+  ]
+}

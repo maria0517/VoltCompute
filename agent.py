@@ -39,7 +39,7 @@ class VoltComputeAgent:
         self._load_model()
 
     def _load_model(self) -> None:
-        """Încarcă modelul XGBoost din model.joblib sau models/model_surplus.pkl dacă este disponibil."""
+        """Încarcă modelul XGBoost din models/model_surplus.pkl sau model.joblib dacă este disponibil."""
         candidate_paths = [
             self.model_path,
             Path("models/model_surplus.pkl"),
@@ -63,6 +63,75 @@ class VoltComputeAgent:
                 except Exception:
                     continue
         self.model_artifact = None
+
+    def _build_features_df(self, grid: GridTelemetry) -> Tuple[pd.DataFrame, float]:
+        """Construiește DataFrame-ul de features pentru inferența modelului ML."""
+        ambient_temp = grid.ambient_temp_celsius if grid.ambient_temp_celsius is not None else 22.0
+        da_price = grid.day_ahead_price_eur if grid.day_ahead_price_eur is not None else 60.0
+        is_weekend = grid.is_weekend if grid.is_weekend is not None else 0
+        temp_derating = 1.0 - max(0.0, (ambient_temp - 25.0) * 0.004)
+
+        feature_cols = (
+            self.model_artifact.get(
+                "feature_columns",
+                [
+                    "hour",
+                    "solar_irradiance_wm2",
+                    "ambient_temp_celsius",
+                    "day_ahead_price_eur",
+                    "grid_capacity_limit_mw",
+                ],
+            )
+            if self.model_artifact is not None
+            else [
+                "hour",
+                "solar_irradiance_wm2",
+                "ambient_temp_celsius",
+                "day_ahead_price_eur",
+                "grid_capacity_limit_mw",
+            ]
+        )
+        row_dict = {
+            "hour": grid.hour,
+            "hour_sin": float(np.sin(2.0 * np.pi * grid.hour / 24.0)),
+            "hour_cos": float(np.cos(2.0 * np.pi * grid.hour / 24.0)),
+            "is_weekend": is_weekend,
+            "solar_irradiance_wm2": grid.solar_irradiance_wm2,
+            "ambient_temp_celsius": ambient_temp,
+            "day_ahead_price_eur": da_price,
+            "grid_capacity_limit_mw": grid.grid_capacity_limit_mw,
+            "effective_solar_index": (grid.solar_irradiance_wm2 / 1000.0) * temp_derating,
+            "price_surplus_signal": float(np.clip((60.0 - da_price) / 60.0, -1.5, 2.0)),
+        }
+        features_df = pd.DataFrame([{k: row_dict[k] for k in feature_cols if k in row_dict}])
+        return features_df, temp_derating
+
+    def estimate_injection(self, grid: GridTelemetry) -> float:
+        """
+        Prezice injecția netă în rețea (MW) folosind modelul ML antrenat pe train_energy_data.csv.
+        La noapte (iradianță 0), injecția solară este 0.0 MW.
+        """
+        if grid.solar_irradiance_wm2 <= 1.0:
+            return 0.0
+        ambient_temp = grid.ambient_temp_celsius if grid.ambient_temp_celsius is not None else 22.0
+        temp_derating = 1.0 - max(0.0, (ambient_temp - 25.0) * 0.004)
+        gross_solar_mw = (grid.solar_irradiance_wm2 / 1000.0) * 17.8 * temp_derating
+        local_load_mw = 1.4 + 0.5 * float(np.sin(np.pi * grid.hour / 12.0))
+        physics_inj_mw = max(0.0, gross_solar_mw - local_load_mw)
+
+        if self.model_artifact is not None:
+            try:
+                features_df, _ = self._build_features_df(grid)
+                if "injection_model" in self.model_artifact:
+                    inj_pred = float(self.model_artifact["injection_model"].predict(features_df)[0])
+                    return round(max(0.0, inj_pred), 3)
+                if "model" in self.model_artifact:
+                    surplus_pred = float(self.model_artifact["model"].predict(features_df)[0])
+                    if surplus_pred > 0.05:
+                        return round(grid.grid_capacity_limit_mw + surplus_pred, 3)
+            except Exception:
+                pass
+        return round(physics_inj_mw, 3)
 
     def perceive(
         self,
@@ -109,14 +178,12 @@ class VoltComputeAgent:
     ) -> Tuple[float, float, Dict[str, float]]:
         """
         Pasul 2: ESTIMATE
-        Calculează surplusul estimat (MW), scorul de confidență (0.0-1.0)
+        Calculează surplusul estimat (MW) direct din modelul ML antrenat, scorul de confidență (0.0-1.0)
         și top contribuții de tip SHAP pentru explicabilitate în fața dispecerului.
-        Include fallback fizic determinist dacă modelul .pkl nu este încă antrenat.
+        Include fallback fizic doar dacă modelul .pkl nu este disponibil.
         """
-        # Estimare fizică de referință (folosită atât ca fallback, cât și pentru verificarea coerenței)
         ambient_temp = grid.ambient_temp_celsius if grid.ambient_temp_celsius is not None else 22.0
         da_price = grid.day_ahead_price_eur if grid.day_ahead_price_eur is not None else 60.0
-        is_weekend = grid.is_weekend if grid.is_weekend is not None else 0
 
         temp_derating = 1.0 - max(0.0, (ambient_temp - 25.0) * 0.004)
         gross_solar_mw = (grid.solar_irradiance_wm2 / 1000.0) * 17.8 * temp_derating
@@ -125,36 +192,23 @@ class VoltComputeAgent:
         physics_surplus_mw = max(0.0, net_injection_mw - grid.grid_capacity_limit_mw)
 
         predicted_surplus_mw = physics_surplus_mw
+        ml_uncertainty_mw = 0.25
 
-        if self.model_artifact is not None and "model" in self.model_artifact:
+        if grid.solar_irradiance_wm2 <= 1.0:
+            predicted_surplus_mw = 0.0
+        elif self.model_artifact is not None and "model" in self.model_artifact:
             try:
                 model = self.model_artifact["model"]
-                feature_cols = self.model_artifact.get(
-                    "feature_columns",
-                    [
-                        "hour",
-                        "solar_irradiance_wm2",
-                        "ambient_temp_celsius",
-                        "day_ahead_price_eur",
-                        "grid_capacity_limit_mw",
-                    ],
-                )
-                row_dict = {
-                    "hour": grid.hour,
-                    "hour_sin": float(np.sin(2.0 * np.pi * grid.hour / 24.0)),
-                    "hour_cos": float(np.cos(2.0 * np.pi * grid.hour / 24.0)),
-                    "is_weekend": is_weekend,
-                    "solar_irradiance_wm2": grid.solar_irradiance_wm2,
-                    "ambient_temp_celsius": ambient_temp,
-                    "day_ahead_price_eur": da_price,
-                    "grid_capacity_limit_mw": grid.grid_capacity_limit_mw,
-                    "effective_solar_index": (grid.solar_irradiance_wm2 / 1000.0) * temp_derating,
-                    "price_surplus_signal": float(np.clip((60.0 - da_price) / 60.0, -1.5, 2.0)),
-                }
-                features_df = pd.DataFrame([{k: row_dict[k] for k in feature_cols if k in row_dict}])
+                features_df, _ = self._build_features_df(grid)
                 raw_pred = float(model.predict(features_df)[0])
-                # Combinăm predicția ML cu ancora fizică pentru stabilitate pe scenarii extreme
-                predicted_surplus_mw = max(0.0, 0.7 * raw_pred + 0.3 * physics_surplus_mw)
+                # Ajustăm doar dacă limita liniei diferă de cea standard (10.0 MW)
+                limit_shift = 10.0 - float(grid.grid_capacity_limit_mw)
+                predicted_surplus_mw = max(0.0, raw_pred + limit_shift)
+
+                if "uncertainty_model" in self.model_artifact:
+                    ml_uncertainty_mw = max(
+                        0.0, float(self.model_artifact["uncertainty_model"].predict(features_df)[0])
+                    )
             except Exception:
                 predicted_surplus_mw = physics_surplus_mw
 
@@ -164,9 +218,8 @@ class VoltComputeAgent:
         elif grid.weather_stability_index is not None:
             confidence = float(np.clip(grid.weather_stability_index, 0.0, 1.0))
         else:
-            # Scor de confidență bazat pe coerența dintre iradianța solară, oră și prețul PZU
-            base_conf = 0.92
-            # Dacă e miezul zilei, dar iradianța e moderată și prețul PZU e foarte volatil -> nebulozitate variabilă
+            # Scor de confidență dinamic din modelul ML de incertitudine + regim meteo
+            base_conf = float(np.clip(0.95 - ml_uncertainty_mw * 0.14, 0.76, 0.96))
             if 10 <= grid.hour <= 16 and 300 <= grid.solar_irradiance_wm2 <= 620 and da_price > 95:
                 base_conf = 0.64
             elif ambient_temp > 42.0 or grid.solar_irradiance_wm2 > 1200.0:
@@ -322,4 +375,3 @@ class VoltComputeAgent:
             grid, confidence_override=confidence_override
         )
         return self.decide(grid, center, surplus_mw, confidence, top_shap)
-
