@@ -433,7 +433,6 @@ total_alloc_T = round(sum(a["allocated_mw"] for a in allocs_T), 2)
 revenue_T = round(total_alloc_T * FIXED_PRICE_EUR, 2)
 
 is_accepted = (st.session_state.accepted.get(T) == "ACCEPTED")
-is_refused = (st.session_state.accepted.get(T) == "REFUSED")
 
 
 def _get_alloc_for_step(step_idx: int) -> float:
@@ -444,7 +443,7 @@ def _get_alloc_for_step(step_idx: int) -> float:
 cumulative_profit = sum(
     _get_alloc_for_step(idx) * FIXED_PRICE_EUR
     for idx, status in st.session_state.accepted.items()
-    if status == "ACCEPTED"
+    if status == "ACCEPTED" and idx <= T
 )
 
 # Curentul real (injecția netă măsurată în teren) vs predicția AI și după dispecerizare
@@ -469,7 +468,7 @@ if is_accepted and total_alloc_T > 0:
         f'<div class="vc-alert vc-alert-green">✅ REȚEA STABILIZATĂ: Surplusul de {total_alloc_T:.2f} MW '
         f'a fost evacuat la nodurile universitare la {dt_T.strftime("%H:%M")}! '
         f'Curentul a scăzut de la {raw_injection_T:.2f} MW la {actual_injection_T:.2f} MW · '
-        f'Profit PPC confirmat: +{actual_profit_T:,.2f} €</div>'
+        f'Profit PPC: +{actual_profit_T:,.2f} €</div>'
     )
 elif has_upcoming_spike and total_alloc_T == 0:
     s_lead = predict_step(first_spike_idx)[0]
@@ -485,7 +484,7 @@ elif has_upcoming_spike and total_alloc_T == 0:
         alert_html = (
             f'<div class="vc-alert vc-alert-red">🔔 PREAVIZ CURTAILMENT (T+{lead_h}h): '
             f'Modelul AI prognozează un spike critic de {s_lead:.1f} MW la ora {t_lead_str} '
-            f'(peste limita liniei de {grid_limit_mw:.0f} MW) · Pre-rezervă capacitatea universitară cu 2 ore înainte!</div>'
+            f'(peste limita liniei de {grid_limit_mw:.0f} MW) · Rezervă capacitatea universitară cu 2 ore înainte!</div>'
         )
 elif peak_mw > 0.05:
     alert_html = (
@@ -528,8 +527,8 @@ with col_main:
         )
         m4.metric(
             "Profit Arbitraj PPC",
-            f"+{actual_profit_T:,.2f} €",
-            f"Total cumulat: +{cumulative_profit:,.2f} €",
+            f"+{cumulative_profit:,.2f} €",
+            f"+{actual_profit_T:,.2f} € încasat la livrare",
             delta_color="normal",
         )
     else:
@@ -547,8 +546,8 @@ with col_main:
         )
         m4.metric(
             "Profit Arbitraj PPC",
-            f"0.00 €",
-            f"+{revenue_T:,.2f} € în așteptare aprobare" if revenue_T > 0 else f"PZU {float(row_T['day_ahead_price_eur']):.1f} €/MWh",
+            f"+{cumulative_profit:,.2f} €",
+            f"+{revenue_T:,.2f} € la livrarea curentă" if revenue_T > 0 else f"PZU {float(row_T['day_ahead_price_eur']):.1f} €/MWh",
             delta_color="normal" if revenue_T > 0 else "off",
         )
 
@@ -771,9 +770,9 @@ with col_modal:
                 break
 
         status_card = (
-            '<div style="color:#00FF9D;font-weight:700;">● TRANZACȚIE APROBATĂ (REȚEA STABILIZATĂ)</div>'
+            '<div style="color:#00FF9D;font-weight:700;">● TRANZACȚIE PRE-REZERVATĂ (REȚEA STABILIZATĂ)</div>'
             if is_accepted
-            else '<div style="color:#F59E0B;font-weight:700;">⚠️ OFERTĂ ÎN AȘTEPTARE CONFIRMARE</div>'
+            else '<div style="color:#F59E0B;font-weight:700;">⚠️ OFERTĂ DISPONIBILĂ PENTRU PRE-REZERVARE</div>'
         )
 
         st.markdown(
@@ -787,7 +786,7 @@ with col_modal:
     PPC redirecționează <span class="vc-mono" style="color:#00FF9D;">{total_alloc_T:.2f} MW</span> surplus către nodurile academice la
     <span class="vc-mono" style="color:#00FF9D;">{FIXED_PRICE_EUR:.2f} €/MWh</span>.
     <br><br>
-    💰 <b>Profit generat PPC:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{revenue_T:,.2f} €</span>
+    💰 <b>Profit la livrare:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{revenue_T:,.2f} €</span>
     <br>
     📉 <b>Degrevare linie PPC:</b> <span class="vc-mono" style="color:#38BDF8;">-{total_alloc_T:.2f} MW</span> (curentul scade sub 10 MW)
   </div>
@@ -797,32 +796,18 @@ with col_modal:
         )
         k1, k2 = st.columns(2)
         if is_accepted:
-            k1.metric("Profit Încasat", f"+{revenue_T:,.2f} €", delta="Confirmat PPC")
+            k1.metric("Profit Încasat", f"+{revenue_T:,.2f} €", delta="Curent livrat")
             k2.metric("Degrevare Curent", f"-{total_alloc_T:.2f} MW", delta="Rețea stabilă")
         else:
-            k1.metric("Profit Potențial", f"+{revenue_T:,.2f} €", delta="În așteptare")
+            k1.metric("Profit la Livrare", f"+{revenue_T:,.2f} €", delta="În așteptare")
             k2.metric("Surplus de Evacuat", f"{total_alloc_T:.2f} MW", delta="Depășire linie", delta_color="inverse")
 
         if is_accepted:
-            st.success(f"✅ Tranzacție executată! +{revenue_T:,.2f} € profit încasat de PPC, surplus evacuat: {total_alloc_T:.2f} MW.")
-            if st.button("↩️ Anulează Tranzacția (Revino la starea brută)", key=f"reset_{T}", width="stretch"):
-                st.session_state.accepted[T] = None
-                st.toast("Tranzacție anulată - rețeaua a revenit la surplusul inițial.")
-                st.rerun()
-        elif is_refused:
-            st.info("Tranzacție refuzată de dispecer. Surplusul rămâne în rețea.")
-            if st.button("Reevaluează Tranzacția", key=f"reval_{T}", width="stretch"):
-                st.session_state.accepted[T] = None
-                st.rerun()
+            st.success(f"✅ Curent livrat! +{revenue_T:,.2f} € profit încasat, surplus evacuat: {total_alloc_T:.2f} MW.")
         else:
-            b_accept, b_refuse = st.columns([1.7, 1])
-            if b_accept.button(f"⚡ Aprobă & Încasează (+{revenue_T:,.2f} €)", key=f"accept_{T}", type="primary", width="stretch"):
+            if st.button(f"⚡ Rezervă energia în avans (+{revenue_T:,.2f} €)", key=f"book_{T}", type="primary", width="stretch"):
                 st.session_state.accepted[T] = "ACCEPTED"
-                st.toast(f"✅ Dispecerizare aprobată! Profit: +{revenue_T:,.2f} €, Rețea degrevată cu {total_alloc_T:.2f} MW.")
-                st.rerun()
-            if b_refuse.button("Refuză", key=f"refuse_{T}", width="stretch"):
-                st.session_state.accepted[T] = "REFUSED"
-                st.toast("Tranzacție refuzată de dispecer.")
+                st.toast("✅ Energia a fost rezervată în avans. Profitul se încasează la livrare.")
                 st.rerun()
 
         # Posibilitate de pre-rezervare și pentru un vârf viitor
@@ -872,10 +857,10 @@ with col_modal:
     Modelul AI prognozează un surplus critic de <span class="vc-mono" style="color:#FF7B7B;">{s_spike:.2f} MW</span>
     la ora <span class="vc-mono" style="color:#FFFFFF;">{spike_dt.strftime('%H:%M')}</span> (în {lead_h} ore), depășind limita liniei de 10 MW!
     <br><br>
-    ⚡ <b>De ce pre-rezervăm cu 2 ore înainte?</b><br>
+    ⚡ <b>De ce rezervăm cu 2 ore înainte?</b><br>
     Permite clusterului UPB să coboare temperatura camerelor de servere și să aloce nodurile Slurm în avans, fără șoc termic.
     <br><br>
-    💰 <b>Profit viitor securizat:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{profit_spike:,.2f} €</span>
+    💰 <b>Valoare la livrare:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{profit_spike:,.2f} €</span>
     <br>
     📉 <b>Degrevare viitoare prognozată:</b> <span class="vc-mono" style="color:#38BDF8;">-{alloc_spike_mw:.2f} MW</span> (vârf tăiat în avans)
   </div>
@@ -885,19 +870,15 @@ with col_modal:
         )
         k1, k2 = st.columns(2)
         if is_spike_prebooked:
-            k1.metric(f"Profit Securizat ({spike_dt.strftime('%H:%M')})", f"+{profit_spike:,.2f} €", delta="Pre-rezervat ✅")
+            k1.metric(f"Profit la Livrare ({spike_dt.strftime('%H:%M')})", f"+{profit_spike:,.2f} €", delta="Rezervat ✅")
             k2.metric(f"Vârf Tăiat ({spike_dt.strftime('%H:%M')})", f"-{alloc_spike_mw:.2f} MW", delta="Sub 10 MW ✅")
-            st.success(f"✅ Vârf pre-rezervat pentru ora {spike_dt.strftime('%H:%M')}! Curba din grafic este tăiată în avans.")
-            if st.button(f"↩️ Anulează Pre-rezervarea ({spike_dt.strftime('%H:%M')})", key=f"reset_spike_{first_spike_idx}", width="stretch"):
-                st.session_state.accepted[first_spike_idx] = None
-                st.toast(f"Pre-rezervare anulată pentru ora {spike_dt.strftime('%H:%M')}.")
-                st.rerun()
+            st.success(f"✅ Vârf rezervat pentru ora {spike_dt.strftime('%H:%M')}! Curba din grafic este tăiată în avans.")
         else:
-            k1.metric("Profit Viitor", f"+{profit_spike:,.2f} €", delta=f"La {spike_dt.strftime('%H:%M')}")
+            k1.metric("Valoare la Livrare", f"+{profit_spike:,.2f} €", delta=f"La {spike_dt.strftime('%H:%M')}")
             k2.metric("Spike Prognozat", f"{s_spike:.2f} MW", delta=f"În {lead_h}h", delta_color="inverse")
-            if st.button(f"⚡ Pre-rezervă Bateria Virtuală ({spike_dt.strftime('%H:%M')}) (+{profit_spike:,.2f} €)", key=f"book_spike_{first_spike_idx}", type="primary", width="stretch"):
+            if st.button(f"⚡ Rezervă energia în avans ({spike_dt.strftime('%H:%M')}) (+{profit_spike:,.2f} €)", key=f"book_spike_{first_spike_idx}", type="primary", width="stretch"):
                 st.session_state.accepted[first_spike_idx] = "ACCEPTED"
-                st.toast(f"✅ Pre-rezervare confirmată pentru ora {spike_dt.strftime('%H:%M')}! Vârful a fost tăiat.")
+                st.toast(f"✅ Energia a fost rezervată în avans pentru ora {spike_dt.strftime('%H:%M')}.")
                 st.rerun()
 
     # CAZUL 3: Nici la T și nici în viitorul apropiat nu se prognozează surplus
