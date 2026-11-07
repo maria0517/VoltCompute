@@ -90,7 +90,7 @@ class VoltComputeSimulator:
                     stability_idx = 0.96
 
             elif scenario_name == "UNCERTAIN_WEATHER_SHOCK":
-                if 11 <= hour <= 15:
+                if 9 <= hour <= 16:
                     # Fluctuații severe de iradianță + volatilitate preț -> confidență < 0.75
                     irr = float(sunny_irradiance[hour] * 0.92)
                     da_price = 110.0
@@ -100,7 +100,7 @@ class VoltComputeSimulator:
                     stability_idx = 0.58  # Sub pragul de 0.75 -> ESCALATE_TO_HUMAN
 
             elif scenario_name == "DATACENTER_THERMAL_RISK":
-                if 11 <= hour <= 15:
+                if 9 <= hour <= 16:
                     # Surplus mare disponibil, dar chillerul centrului de date este supraîncărcat (28.5°C)
                     irr = float(sunny_irradiance[hour] * 1.03)
                     ambient_temp = 35.5

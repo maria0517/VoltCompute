@@ -1,0 +1,27 @@
+{
+  "trained_at": "2026-11-07T15:21:49.930306",
+  "model_type": "HistGradientBoostingRegressor (fallback fara libomp)",
+  "dataset_rows": 1440,
+  "train_rows": 1152,
+  "test_rows": 288,
+  "split_strategy": "train_test_split(shuffle=False, test_size=0.2)",
+  "baseline_dummy": {
+    "mae": 0.941,
+    "rmse": 1.4248
+  },
+  "xgboost_regressor": {
+    "mae": 0.0395,
+    "rmse": 0.1108
+  },
+  "improvement_pct": {
+    "mae_reduction_pct": 95.81,
+    "rmse_reduction_pct": 92.22
+  },
+  "feature_importances": {
+    "hour": 0.0039,
+    "solar_irradiance_wm2": 0.9942,
+    "ambient_temp_celsius": 0.0006,
+    "day_ahead_price_eur": 0.0013,
+    "grid_capacity_limit_mw": 0.0
+  }
+}

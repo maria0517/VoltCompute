@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 from pydantic import BaseModel, Field, field_validator
 
@@ -23,15 +23,15 @@ class GridTelemetry(BaseModel):
         le=1500.0,
         description="Iradianța solară măsurată în W/m²",
     )
-    ambient_temp_celsius: float = Field(
-        ...,
+    ambient_temp_celsius: Optional[float] = Field(
+        default=None,
         ge=-40.0,
         le=60.0,
-        description="Temperatura ambientală la nivelul panourilor (°C)",
+        description="Temperatura ambientală la nivelul panourilor (°C). Dacă lipsește (None), agentul o imputează.",
     )
-    day_ahead_price_eur: float = Field(
-        ...,
-        description="Prețul energiei pe piața pentru ziua următoare (PZU / Day-Ahead) în EUR/MWh",
+    day_ahead_price_eur: Optional[float] = Field(
+        default=None,
+        description="Prețul energiei pe piața PZU / Day-Ahead în EUR/MWh. Dacă lipsește (None), agentul îl imputează.",
     )
     grid_capacity_limit_mw: float = Field(
         default=10.0,
@@ -43,6 +43,12 @@ class GridTelemetry(BaseModel):
         ge=0.0,
         le=1.0,
         description="Indice opțional de stabilitate meteo (0.0 = furtună/fluctuații severe, 1.0 = cer senin stabil)",
+    )
+    is_weekend: Optional[int] = Field(
+        default=0,
+        ge=0,
+        le=1,
+        description="Indicator zi de weekend (1 = Sâmbătă/Duminică cu consum redus în rețea, 0 = Luni-Vineri)",
     )
 
 
@@ -119,6 +125,14 @@ class AgentDecision(BaseModel):
         default_factory=dict,
         description="Contribuția principalelor variabile la predicție (explicabilitate XAI / SHAP)",
     )
+    similar_historical_cases: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Cele mai similare cazuri din istoric folosite pentru justificarea deciziei",
+    )
+    data_quality_warnings: List[str] = Field(
+        default_factory=list,
+        description="Avertismente privind senzori secundari lipsă care au fost imputați automat",
+    )
 
     @field_validator("confidence_score")
     @classmethod
@@ -148,4 +162,3 @@ class DispatchAction(BaseModel):
         ...,
         description="Acțiunea finală a operatorului sau a sistemului automat",
     )
-
