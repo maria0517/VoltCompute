@@ -101,7 +101,11 @@ class VoltComputeAgent:
         Include fallback fizic determinist dacă modelul .pkl nu este încă antrenat.
         """
         # Estimare fizică de referință (folosită atât ca fallback, cât și pentru verificarea coerenței)
-        temp_derating = 1.0 - max(0.0, (grid.ambient_temp_celsius - 25.0) * 0.004)
+        ambient_temp = grid.ambient_temp_celsius if grid.ambient_temp_celsius is not None else 22.0
+        da_price = grid.day_ahead_price_eur if grid.day_ahead_price_eur is not None else 60.0
+        is_weekend = grid.is_weekend if grid.is_weekend is not None else 0
+
+        temp_derating = 1.0 - max(0.0, (ambient_temp - 25.0) * 0.004)
         gross_solar_mw = (grid.solar_irradiance_wm2 / 1000.0) * 17.8 * temp_derating
         local_load_mw = 1.4 + 0.5 * float(np.sin(np.pi * grid.hour / 12.0))
         net_injection_mw = max(0.0, gross_solar_mw - local_load_mw)
@@ -112,17 +116,29 @@ class VoltComputeAgent:
         if self.model_artifact is not None and "model" in self.model_artifact:
             try:
                 model = self.model_artifact["model"]
-                features_df = pd.DataFrame(
+                feature_cols = self.model_artifact.get(
+                    "feature_columns",
                     [
-                        {
-                            "hour": grid.hour,
-                            "solar_irradiance_wm2": grid.solar_irradiance_wm2,
-                            "ambient_temp_celsius": grid.ambient_temp_celsius,
-                            "day_ahead_price_eur": grid.day_ahead_price_eur,
-                            "grid_capacity_limit_mw": grid.grid_capacity_limit_mw,
-                        }
-                    ]
+                        "hour",
+                        "solar_irradiance_wm2",
+                        "ambient_temp_celsius",
+                        "day_ahead_price_eur",
+                        "grid_capacity_limit_mw",
+                    ],
                 )
+                row_dict = {
+                    "hour": grid.hour,
+                    "hour_sin": float(np.sin(2.0 * np.pi * grid.hour / 24.0)),
+                    "hour_cos": float(np.cos(2.0 * np.pi * grid.hour / 24.0)),
+                    "is_weekend": is_weekend,
+                    "solar_irradiance_wm2": grid.solar_irradiance_wm2,
+                    "ambient_temp_celsius": ambient_temp,
+                    "day_ahead_price_eur": da_price,
+                    "grid_capacity_limit_mw": grid.grid_capacity_limit_mw,
+                    "effective_solar_index": (grid.solar_irradiance_wm2 / 1000.0) * temp_derating,
+                    "price_surplus_signal": float(np.clip((60.0 - da_price) / 60.0, -1.5, 2.0)),
+                }
+                features_df = pd.DataFrame([{k: row_dict[k] for k in feature_cols if k in row_dict}])
                 raw_pred = float(model.predict(features_df)[0])
                 # Combinăm predicția ML cu ancora fizică pentru stabilitate pe scenarii extreme
                 predicted_surplus_mw = max(0.0, 0.7 * raw_pred + 0.3 * physics_surplus_mw)
@@ -138,17 +154,17 @@ class VoltComputeAgent:
             # Scor de confidență bazat pe coerența dintre iradianța solară, oră și prețul PZU
             base_conf = 0.92
             # Dacă e miezul zilei, dar iradianța e moderată și prețul PZU e foarte volatil -> nebulozitate variabilă
-            if 10 <= grid.hour <= 16 and 300 <= grid.solar_irradiance_wm2 <= 620 and grid.day_ahead_price_eur > 95:
+            if 10 <= grid.hour <= 16 and 300 <= grid.solar_irradiance_wm2 <= 620 and da_price > 95:
                 base_conf = 0.64
-            elif grid.ambient_temp_celsius > 42.0 or grid.solar_irradiance_wm2 > 1200.0:
+            elif ambient_temp > 42.0 or grid.solar_irradiance_wm2 > 1200.0:
                 base_conf = 0.70
             confidence = float(np.clip(base_conf, 0.0, 1.0))
 
         # Calcul atribuire locală explicabilă (stil SHAP values în MW)
         irradiance_contrib = round((grid.solar_irradiance_wm2 - 500.0) / 150.0, 3)
         grid_limit_contrib = round((10.0 - grid.grid_capacity_limit_mw) * 0.85, 3)
-        price_signal_contrib = round((50.0 - grid.day_ahead_price_eur) / 45.0, 3)
-        temp_contrib = round((25.0 - grid.ambient_temp_celsius) * 0.05, 3)
+        price_signal_contrib = round((50.0 - da_price) / 45.0, 3)
+        temp_contrib = round((25.0 - ambient_temp) * 0.05, 3)
 
         top_shap = {
             "solar_irradiance_wm2": irradiance_contrib,
