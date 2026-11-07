@@ -1,3 +1,5 @@
+import calendar
+import ctypes
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -195,15 +197,61 @@ def ensure_model(agent: VoltComputeAgent) -> str:
     return "physics fallback"
 
 
+class _SYSTEMTIME(ctypes.Structure):
+    _fields_ = [
+        ("wYear", ctypes.c_uint16),
+        ("wMonth", ctypes.c_uint16),
+        ("wDayOfWeek", ctypes.c_uint16),
+        ("wDay", ctypes.c_uint16),
+        ("wHour", ctypes.c_uint16),
+        ("wMinute", ctypes.c_uint16),
+        ("wSecond", ctypes.c_uint16),
+        ("wMilliseconds", ctypes.c_uint16),
+    ]
+
+
+@st.cache_data(show_spinner=False)
+def get_windows_month_start() -> datetime:
+    """
+    Preia anul și luna de start printr-un apel API nativ către Windows (`kernel32.dll -> GetLocalTime`).
+    Include fallback pe ceasul sistemului dacă rulează în Linux/Docker.
+    """
+    try:
+        if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "kernel32"):
+            sys_time = _SYSTEMTIME()
+            ctypes.windll.kernel32.GetLocalTime(ctypes.byref(sys_time))
+            return datetime(int(sys_time.wYear), int(sys_time.wMonth), 1, 0, 0, 0)
+    except Exception:
+        pass
+    now = datetime.now()
+    return datetime(now.year, now.month, 1, 0, 0, 0)
+
+
 feed, N_TRAIN_ROWS, feed_source = load_feed()
+N_FEED = len(feed)
 datacenter_feed = load_datacenter_feed()
 DATACENTER_LOOKUP = datacenter_feed.set_index(["dt", "dc_id"]).to_dict("index")
 DATACENTER_HOUR_LOOKUP = {
     (int(row["hour"]), row["dc_id"]): row.to_dict()
     for _, row in datacenter_feed.iterrows()
 }
-N_ROWS = len(feed)  # 288h (12 zile complete 00:00 -> 23:00 pentru Ring Buffer fără discontinuitate)
-BASE_LIVE_DT: datetime = feed.iloc[0]["dt"].to_pydatetime()
+BASE_LIVE_DT: datetime = get_windows_month_start()
+
+
+def _month_window(cycle: int) -> Tuple[datetime, int, int]:
+    """
+    Returnează (data_start_lună, număr_ore_în_lună, offset_ore_față_de_BASE_LIVE_DT)
+    pentru luna corespunzătoare ciclului `cycle` (0 = luna din Windows API, 1 = luna următoare etc.).
+    """
+    total_month_idx = (BASE_LIVE_DT.month - 1) + int(cycle)
+    year = BASE_LIVE_DT.year + (total_month_idx // 12)
+    month = (total_month_idx % 12) + 1
+    days_in_month = calendar.monthrange(year, month)[1]
+    month_start = datetime(year, month, 1, 0, 0, 0)
+    offset_hours = int(round((month_start - BASE_LIVE_DT).total_seconds() / 3600.0))
+    return month_start, days_in_month * 24, offset_hours
+
+
 # Scală verticală fixă pentru grafic, ca axa să nu "sară" la fiecare tick (ca pe un terminal de bursă)
 Y_AXIS_MAX = float(feed["gross_solar_mw"].max()) * 1.08 + 0.5
 
@@ -235,6 +283,8 @@ if "refused" not in st.session_state:
     st.session_state.refused = {}
 if "ring_cycle" not in st.session_state:
     st.session_state.ring_cycle = 0
+
+_, _init_month_hours, _ = _month_window(int(st.session_state.ring_cycle))
 if "current_step" not in st.session_state:
     candidates = (
         feed[(feed["hour"] == 13) & (feed.get("surplus_mw", 0) > 3.5)]
@@ -248,7 +298,7 @@ if "current_step" not in st.session_state:
     else:
         noon = feed[feed["hour"].isin([12, 13])]
         default_step = int(noon.index[0]) if len(noon) > 0 else 13
-    st.session_state.current_step = int(default_step % N_ROWS)
+    st.session_state.current_step = int(default_step % _init_month_hours)
 
 # Notificările generate în callback-uri sunt afișate la începutul următoarei rulări
 
@@ -257,26 +307,30 @@ _toast_msg = st.session_state.pop("toast_msg", None)
 if _toast_msg:
     st.toast(_toast_msg)
 
-# Avansarea automată în Ring Buffer (fără oprire la capăt; trece lin din 23:00 în 00:00)
+# Avansarea automată în Ring Buffer (când se termină luna curentă la 23:00, trece în ziua 1 ora 00:00 a lunii următoare)
 if st.session_state.pending_advance:
     st.session_state.pending_advance = False
+    _, _cur_month_hours, _ = _month_window(int(st.session_state.ring_cycle))
     nxt_step = int(st.session_state.current_step) + 1
-    if nxt_step >= N_ROWS:
+    if nxt_step >= _cur_month_hours:
         st.session_state.current_step = 0
         st.session_state.ring_cycle = int(st.session_state.ring_cycle) + 1
     else:
         st.session_state.current_step = nxt_step
+
+CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS = _month_window(int(st.session_state.ring_cycle))
+st.session_state.current_step = int(min(max(0, int(st.session_state.current_step)), N_ROWS - 1))
 
 agent: VoltComputeAgent = st.session_state.agent
 
 
 def _ring_row(v_idx: int) -> pd.Series:
     """Returnează rândul din Ring Buffer corespunzător indexului virtual continuu `v_idx`."""
-    return feed.iloc[v_idx % N_ROWS]
+    return feed.iloc[v_idx % N_FEED]
 
 
 def _ring_dt(v_idx: int) -> datetime:
-    """Returnează timestamp-ul continuu monoton pentru indexul virtual `v_idx` din Ring Buffer."""
+    """Returnează timestamp-ul continuu monoton pentru indexul virtual `v_idx` (pornind din luna Windows API)."""
     return BASE_LIVE_DT + timedelta(hours=int(v_idx))
 
 
@@ -286,7 +340,7 @@ def _cycle_variation(v_idx: int) -> Tuple[float, float, float]:
     stocastică deterministă (nor tranzitoriu + fluctuație de sarcină) astfel încât fluxul live
     să genereze mereu date noi, fără să repete identic aceiași megawați.
     """
-    v_cycle = v_idx // N_ROWS
+    v_cycle = v_idx // N_FEED
     if v_cycle == 0:
         return 1.0, 0.0, 0.0
     rng = np.random.default_rng(seed=100_003 + int(v_idx) * 31)
@@ -572,8 +626,10 @@ def _step_back() -> None:
     st.session_state.autoplay = False
     prv = int(st.session_state.current_step) - 1
     if prv < 0:
-        st.session_state.current_step = N_ROWS - 1
-        st.session_state.ring_cycle = int(st.session_state.ring_cycle) - 1
+        prev_cycle = int(st.session_state.ring_cycle) - 1
+        _, prev_month_hours, _ = _month_window(prev_cycle)
+        st.session_state.ring_cycle = prev_cycle
+        st.session_state.current_step = prev_month_hours - 1
     else:
         st.session_state.current_step = prv
 
@@ -581,8 +637,9 @@ def _step_back() -> None:
 def _next_hour() -> None:
     """Pas Înainte / Simulează Ora Următoare: avansează o oră (Ring Buffer, 23:00 -> 00:00 fără oprire)."""
     st.session_state.autoplay = False
+    _, cur_month_hours, _ = _month_window(int(st.session_state.ring_cycle))
     nxt = int(st.session_state.current_step) + 1
-    if nxt >= N_ROWS:
+    if nxt >= cur_month_hours:
         st.session_state.current_step = 0
         st.session_state.ring_cycle = int(st.session_state.ring_cycle) + 1
     else:
@@ -593,7 +650,7 @@ def _toggle_play() -> None:
     st.session_state.autoplay = not st.session_state.autoplay
 
 
-abs_T = int(st.session_state.ring_cycle) * N_ROWS + int(st.session_state.current_step)
+abs_T = CYCLE_OFFSET_HOURS + int(st.session_state.current_step)
 # Calculăm eroarea MAE live pe ultimele 24h (doar orele de zi cu activitate solară) pentru afișare transparentă
 _day_hist_errors = [
     abs(net_injection_mw(i) - predict_step(i)[3])
@@ -602,15 +659,29 @@ _day_hist_errors = [
 ]
 live_window_mae = float(np.mean(_day_hist_errors)) if _day_hist_errors else 0.42
 
-st.markdown(
-    f"""
+hdr_main, hdr_map_btn = st.columns([5.6, 1.4], gap="small")
+with hdr_main:
+    st.markdown(
+        f"""
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
   <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH</div>
-  <div class="vc-sub">TRAIN SET: {N_TRAIN_ROWS}h · LIVE RING BUFFER: {N_ROWS}h Date Noi (Ciclu #{int(st.session_state.ring_cycle) + 1}) · MAE Live (24h): ±{live_window_mae:.2f} MW</div>
+  <div class="vc-sub">LUNA CURENTĂ: {CYCLE_START_DT.strftime('%Y-%m')} (Windows API) · {N_ROWS}h în lună (Luna #{int(st.session_state.ring_cycle) + 1}) · MAE Live (24h): ±{live_window_mae:.2f} MW</div>
 </div>
 """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
+with hdr_map_btn:
+    st.page_link("pages/1_Harta_Retea_SCADA.py", label="🗺️ Harta Rețea SCADA", width="stretch")
+
+current_cycle = int(st.session_state.ring_cycle)
+slider_key = f"timeline_slider_{current_cycle}"
+st.session_state[slider_key] = int(st.session_state.current_step)
+
+
+def _on_slider_change(s_key: str) -> None:
+    st.session_state.autoplay = False
+    st.session_state.current_step = int(st.session_state[s_key])
+
 
 bar_back, bar_fwd, bar_play, bar_slider = st.columns([1, 1.5, 1.5, 4.5], gap="small")
 bar_back.button(
@@ -639,8 +710,10 @@ with bar_slider:
     st.select_slider(
         "Timeline",
         options=list(range(N_ROWS)),
-        key="current_step",
-        format_func=lambda i: feed.iloc[i]["dt"].strftime("%a %d %b · %H:%M"),
+        key=slider_key,
+        on_change=_on_slider_change,
+        args=(slider_key,),
+        format_func=lambda i, off=CYCLE_OFFSET_HOURS: _ring_dt(off + int(i)).strftime("%Y-%m-%d %H:%M"),
         label_visibility="collapsed",
         help="Sari direct la orice oră din setul de date live (out-of-sample).",
     )
@@ -648,7 +721,7 @@ with bar_slider:
 # =====================================================================
 # STATE AT STEP T + LOOKAHEAD (IN RING BUFFER)
 # =====================================================================
-T = int(st.session_state.ring_cycle) * N_ROWS + int(st.session_state.current_step)
+T = CYCLE_OFFSET_HOURS + int(st.session_state.current_step)
 row_T = _ring_row(T)
 dt_T = _ring_dt(T)
 surplus_T, conf_T, shap_T, pred_inj_T = predict_step(T)
