@@ -1,6 +1,6 @@
 import pickle
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -24,14 +24,30 @@ class VoltComputeAgent:
     Ciclul agentului:
     1. perceive() -> Validare strictă a telemetriei cu Pydantic v2.
     2. estimate() -> Predicție surplus (MW), scor de confidență și explicații SHAP/atribuire.
-    3. decide()   -> Aplicare reguli de siguranță (confidență, protecție termică servere, prag 2.0 MW).
+    3. decide()   -> Aplicare reguli de siguranță (anomalii >3σ, confidență, protecție termică HVAC <= 26°C,
+                     prag de activare: surplus > 5 MW ȘI preț PZU < 25 EUR/MWh).
     4. act()      -> Formatare payload dispecerizare pentru integrarea cu SCADA / HPC.
     """
 
     CONFIDENCE_THRESHOLD: float = 0.75
-    THERMAL_LIMIT_CELSIUS: float = 25.0
-    MIN_SURPLUS_THRESHOLD_MW: float = 2.0
-    FIXED_GREEN_PRICE_EUR: float = 30.0
+    THERMAL_LIMIT_CELSIUS: float = 26.0       # Filtru siguranță termică HVAC: temp <= 26°C
+    MIN_SURPLUS_THRESHOLD_MW: float = 5.0     # Prag activare: surplus prezis > 5 MW
+    MAX_PZU_PRICE_EUR: float = 25.0           # ... ȘI preț PZU < 25 EUR/MWh
+    FIXED_GREEN_PRICE_EUR: float = 30.0       # Tarif fix de arbitraj (nu scade la refuz)
+    ANOMALY_SIGMA: float = 3.0                # Senzori > 3σ față de distribuția de antrenare -> UNCERTAIN
+
+    # Senzorii brut monitorizați pentru detecția de anomalii (z-score față de setul de antrenare)
+    MONITORED_SENSORS: Tuple[str, ...] = (
+        "solar_irradiance_wm2",
+        "ambient_temp_celsius",
+        "day_ahead_price_eur",
+    )
+    # Statistici de rezervă (din train_energy_data.csv) dacă artefactul nu le conține
+    DEFAULT_SENSOR_STATS: Dict[str, Dict[str, float]] = {
+        "solar_irradiance_wm2": {"mean": 290.22, "std": 339.58},
+        "ambient_temp_celsius": {"mean": 21.04, "std": 6.70},
+        "day_ahead_price_eur": {"mean": 73.98, "std": 32.48},
+    }
 
     def __init__(self, model_path: Union[str, Path] = DEFAULT_MODEL_PATH):
         self.model_path = Path(model_path)
@@ -133,6 +149,47 @@ class VoltComputeAgent:
                 pass
         return round(physics_inj_mw, 3)
 
+    def detect_anomalies(self, grid: GridTelemetry) -> List[str]:
+        """
+        Detecție de anomalii pe senzori: orice valoare aflată la peste 3σ de media din setul de
+        antrenare este marcată. Modelul nu a văzut niciodată astfel de valori, deci predicția lui
+        nu este de încredere -> status UNCERTAIN + notificare către operatorul uman.
+        """
+        stats = (self.model_artifact or {}).get("sensor_stats") or self.DEFAULT_SENSOR_STATS
+        anomalies: List[str] = []
+        for sensor in self.MONITORED_SENSORS:
+            value = getattr(grid, sensor, None)
+            st_ = stats.get(sensor)
+            if value is None or not st_ or float(st_.get("std", 0.0)) <= 0.0:
+                continue
+            z = (float(value) - float(st_["mean"])) / float(st_["std"])
+            if abs(z) > self.ANOMALY_SIGMA:
+                anomalies.append(f"{sensor}={float(value):.1f} (z={z:+.1f}σ)")
+        return anomalies
+
+    @staticmethod
+    def _tree_shap(model: Any, features_df: pd.DataFrame) -> Optional[Dict[str, float]]:
+        """
+        Valori SHAP exacte (TreeSHAP) calculate nativ de XGBoost (`pred_contribs=True`),
+        echivalente cu `shap.TreeExplainer`. Contribuțiile sunt în MW de surplus.
+        Returnează None dacă modelul nu este XGBoost (ex. fallback HistGradientBoosting).
+        """
+        if not hasattr(model, "get_booster"):
+            return None
+        try:
+            import xgboost as xgb
+
+            contribs = model.get_booster().predict(
+                xgb.DMatrix(features_df), pred_contribs=True
+            )[0]
+            values = {
+                col: round(float(v), 3) for col, v in zip(features_df.columns, contribs[:-1])
+            }
+            values["__base_value__"] = round(float(contribs[-1]), 3)
+            return values
+        except Exception:
+            return None
+
     def perceive(
         self,
         grid_input: Union[GridTelemetry, Dict[str, Any]],
@@ -193,6 +250,7 @@ class VoltComputeAgent:
 
         predicted_surplus_mw = physics_surplus_mw
         ml_uncertainty_mw = 0.25
+        real_shap: Optional[Dict[str, float]] = None
 
         if grid.solar_irradiance_wm2 <= 1.0:
             predicted_surplus_mw = 0.0
@@ -201,6 +259,7 @@ class VoltComputeAgent:
                 model = self.model_artifact["model"]
                 features_df, _ = self._build_features_df(grid)
                 raw_pred = float(model.predict(features_df)[0])
+                real_shap = self._tree_shap(model, features_df)
                 # Ajustăm doar dacă limita liniei diferă de cea standard (10.0 MW)
                 limit_shift = 10.0 - float(grid.grid_capacity_limit_mw)
                 predicted_surplus_mw = max(0.0, raw_pred + limit_shift)
@@ -226,7 +285,16 @@ class VoltComputeAgent:
                 base_conf = 0.70
             confidence = float(np.clip(base_conf, 0.0, 1.0))
 
-        # Calcul atribuire locală explicabilă (stil SHAP values în MW)
+        if real_shap is not None:
+            # SHAP real (TreeSHAP din XGBoost), sortat descrescător după impactul absolut
+            ordered = sorted(
+                ((k, v) for k, v in real_shap.items() if k != "__base_value__"),
+                key=lambda kv: abs(kv[1]),
+                reverse=True,
+            )
+            return round(predicted_surplus_mw, 3), round(confidence, 4), dict(ordered)
+
+        # Fallback (fără model XGBoost): atribuire aproximativă în MW
         irradiance_contrib = round((grid.solar_irradiance_wm2 - 500.0) / 150.0, 3)
         grid_limit_contrib = round((10.0 - grid.grid_capacity_limit_mw) * 0.85, 3)
         price_signal_contrib = round((50.0 - da_price) / 45.0, 3)
@@ -248,15 +316,34 @@ class VoltComputeAgent:
         surplus_predicted_mw: float,
         confidence_score: float,
         top_shap_features: Dict[str, float],
+        anomalies: Optional[List[str]] = None,
     ) -> AgentDecision:
         """
         Pasul 3: DECIDE
         Aplică constrângerile stricte de siguranță operațională:
+        0. Senzori anormali (> 3σ) -> UNCERTAIN (notificare operator uman).
         1. Dacă confidence_score < 0.75 -> ESCALATE_TO_HUMAN (fallback la dispecer).
-        2. Dacă cooling_temp_celsius > 25.0 -> NORMAL_GRID_OPERATION (protecție termică servere).
-        3. Dacă surplus_predicted_mw > 2.0 -> OFFER_GENERATED la 30 EUR/MWh pentru min(surplus, max_absorb).
+        2. Dacă cooling_temp_celsius > 26.0 -> NORMAL_GRID_OPERATION (filtru siguranță termică HVAC).
+        3. Dacă surplus > 5 MW ȘI PZU < 25 EUR/MWh -> OFFER_GENERATED la 30 EUR/MWh pentru min(surplus, max_absorb).
         4. Altfel -> NORMAL_GRID_OPERATION.
         """
+        # Regula 0: Date anormale de la senzori (> 3σ) -> modelul nu extrapolează, cere omul
+        if anomalies:
+            return AgentDecision(
+                surplus_predicted_mw=surplus_predicted_mw,
+                confidence_score=min(confidence_score, 0.5),
+                status="UNCERTAIN",
+                allocated_mw=0.0,
+                fixed_price_eur=self.FIXED_GREEN_PRICE_EUR,
+                reasoning=(
+                    "Status UNCERTAIN: senzori cu valori anormale (> 3σ față de istoricul de antrenare): "
+                    + "; ".join(anomalies)
+                    + ". Alocarea automată este suspendată și operatorul uman a fost notificat."
+                ),
+                top_shap_features=top_shap_features,
+                data_quality_warnings=list(anomalies),
+            )
+
         # Regula 1: Pragul de confidență (Safety-First AI)
         if confidence_score < self.CONFIDENCE_THRESHOLD:
             return AgentDecision(
@@ -289,8 +376,13 @@ class VoltComputeAgent:
                 top_shap_features=top_shap_features,
             )
 
-        # Regula 3: Arbitraj activ al surplusului solar (> 2.0 MW)
-        if surplus_predicted_mw > self.MIN_SURPLUS_THRESHOLD_MW and center.max_absorb_capacity_mw > 0:
+        # Regula 3: Arbitraj activ: surplus > 5 MW ȘI preț PZU < 25 EUR/MWh
+        da_price = grid.day_ahead_price_eur if grid.day_ahead_price_eur is not None else 60.0
+        if (
+            surplus_predicted_mw > self.MIN_SURPLUS_THRESHOLD_MW
+            and da_price < self.MAX_PZU_PRICE_EUR
+            and center.max_absorb_capacity_mw > 0
+        ):
             allocated_mw = min(surplus_predicted_mw, center.max_absorb_capacity_mw)
             return AgentDecision(
                 surplus_predicted_mw=surplus_predicted_mw,
@@ -299,7 +391,8 @@ class VoltComputeAgent:
                 allocated_mw=allocated_mw,
                 fixed_price_eur=self.FIXED_GREEN_PRICE_EUR,
                 reasoning=(
-                    f"Surplus solar critic detectat ({surplus_predicted_mw:.2f} MW peste limita de {grid.grid_capacity_limit_mw:.1f} MW). "
+                    f"Surplus solar critic detectat ({surplus_predicted_mw:.2f} MW peste limita de {grid.grid_capacity_limit_mw:.1f} MW, "
+                f"PZU {da_price:.1f} EUR/MWh < {self.MAX_PZU_PRICE_EUR:.0f}). "
                     f"S-a generat oferta automată de {allocated_mw:.2f} MW la tarif verde fix {self.FIXED_GREEN_PRICE_EUR:.0f} EUR/MWh "
                     f"către {center.center_id} ({center.pending_compute_jobs} joburi AI/HPC în așteptare, răcire optimă la {center.cooling_temp_celsius:.1f}°C)."
                 ),
@@ -314,8 +407,8 @@ class VoltComputeAgent:
             allocated_mw=0.0,
             fixed_price_eur=self.FIXED_GREEN_PRICE_EUR,
             reasoning=(
-                f"Rețeaua PPC funcționează în parametri normali (surplus estimat: {surplus_predicted_mw:.2f} MW, "
-                f"sub pragul de activare de {self.MIN_SURPLUS_THRESHOLD_MW:.1f} MW). Nu este necesară redirecționarea."
+                f"Fără arbitraj: surplus estimat {surplus_predicted_mw:.2f} MW, PZU {da_price:.1f} EUR/MWh "
+                f"(activare doar la surplus > {self.MIN_SURPLUS_THRESHOLD_MW:.0f} MW și PZU < {self.MAX_PZU_PRICE_EUR:.0f} EUR/MWh)."
             ),
             top_shap_features=top_shap_features,
         )
@@ -341,7 +434,7 @@ class VoltComputeAgent:
             if decision.status == "OFFER_GENERATED":
                 execution_state = "READY_FOR_AUTO_DISPATCH"
                 effective_mw = decision.allocated_mw
-            elif decision.status == "ESCALATE_TO_HUMAN":
+            elif decision.status in ("ESCALATE_TO_HUMAN", "UNCERTAIN"):
                 execution_state = "AWAITING_HUMAN_OPERATOR"
                 effective_mw = 0.0
             else:
@@ -374,4 +467,5 @@ class VoltComputeAgent:
         surplus_mw, confidence, top_shap = self.estimate(
             grid, confidence_override=confidence_override
         )
-        return self.decide(grid, center, surplus_mw, confidence, top_shap)
+        anomalies = self.detect_anomalies(grid)
+        return self.decide(grid, center, surplus_mw, confidence, top_shap, anomalies=anomalies)

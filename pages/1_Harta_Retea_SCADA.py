@@ -17,6 +17,13 @@ import streamlit as st
 
 from agent import VoltComputeAgent
 from schemas import GridTelemetry
+from services.router import (
+    FIXED_TARIFF_EUR_MWH,
+    HVAC_MAX_TEMP_C,
+    POOL_ALL_DCS_EXHAUSTED,
+    load_profiles,
+    rank_datacenters,
+)
 from simulator import VoltComputeSimulator
 from train import (
     LIVE_TEST_DATA_PATH,
@@ -33,7 +40,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-FIXED_PRICE_EUR = 30.0
+FIXED_PRICE_EUR = FIXED_TARIFF_EUR_MWH
 LOOKAHEAD_HOURS = 2
 HISTORY_HOURS = 24
 REFERENCE_TARIFF_EUR = VoltComputeSimulator.STANDARD_RETAIL_PRICE_EUR
@@ -41,6 +48,9 @@ AUTOPLAY_SECONDS = 1.0
 DATACENTER_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "3_data_centers.csv"
 THERMAL_SAFETY_MARGIN_C = 0.5
 TEMP_RISE_PER_MW_C = 0.5
+DC_PROFILES = load_profiles()
+HVAC_LIMIT_C = float(DC_PROFILES.get("hvac_max_temp_c", HVAC_MAX_TEMP_C))
+_PROFILE_BY_ID = {n["id"]: n for n in DC_PROFILES["datacenters"]}
 
 # Coordonate geografice reale pentru Parcul Solar PPC și nodurile Data Center din România
 PPC_SOLAR_PARK = {
@@ -289,6 +299,11 @@ if "autoplay" not in st.session_state:
     st.session_state.autoplay = False
 if "pending_advance" not in st.session_state:
     st.session_state.pending_advance = False
+if "dc_history" not in st.session_state:
+    st.session_state.dc_history = {
+        n["id"]: dict(_PROFILE_BY_ID.get(n["id"], {}).get("history", {"offers_sent": 0, "offers_accepted": 0}))
+        for n in DATACENTERS
+    }
 if "deals" not in st.session_state:
     st.session_state.deals = {}
 if "refused" not in st.session_state:
@@ -391,20 +406,59 @@ def predict_step(v_idx: int) -> Tuple[float, float, Dict[str, float], float]:
     return cache[v_idx]
 
 
+DC_BY_ID: Dict[str, Dict[str, Any]] = {n["id"]: n for n in DATACENTERS}
 ELIGIBLE_NODES: List[Dict[str, Any]] = sorted(
     DATACENTERS,
     key=lambda n: -n["queue"],
 )
 
 
+def grid_telemetry(v_idx: int) -> GridTelemetry:
+    row = _ring_row(v_idx)
+    irr_factor, temp_offset, _ = _cycle_variation(v_idx)
+    dt_val = _ring_dt(v_idx)
+    irr_val = float(np.clip(float(row["solar_irradiance_wm2"]) * irr_factor, 0.0, 1400.0))
+    temp_val = float(np.clip(float(row["ambient_temp_celsius"]) + temp_offset, -20.0, 55.0))
+    return GridTelemetry(
+        timestamp=dt_val.isoformat(),
+        hour=int(row["hour"]),
+        solar_irradiance_wm2=round(irr_val, 2),
+        ambient_temp_celsius=round(temp_val, 2),
+        day_ahead_price_eur=float(row["day_ahead_price_eur"]),
+        grid_capacity_limit_mw=float(row.get("grid_capacity_limit_mw", 10.0)),
+        is_weekend=int(dt_val.weekday() >= 5),
+    )
+
+
+def step_anomalies(v_idx: int) -> List[str]:
+    return agent.detect_anomalies(grid_telemetry(v_idx))
+
+
+def step_price(v_idx: int) -> float:
+    return float(_ring_row(v_idx)["day_ahead_price_eur"])
+
+
+def _surplus_trigger(step: int) -> bool:
+    return (
+        predict_step(step)[0] > agent.MIN_SURPLUS_THRESHOLD_MW
+        and step_price(step) < agent.MAX_PZU_PRICE_EUR
+    )
+
+
 def step_qualifies(step: int) -> bool:
-    s, c, _, _ = predict_step(step)
-    return s > agent.MIN_SURPLUS_THRESHOLD_MW and c >= agent.CONFIDENCE_THRESHOLD
+    return (
+        _surplus_trigger(step)
+        and not step_anomalies(step)
+        and predict_step(step)[1] >= agent.CONFIDENCE_THRESHOLD
+    )
 
 
 def step_escalated(step: int) -> bool:
-    s, c, _, _ = predict_step(step)
-    return s > agent.MIN_SURPLUS_THRESHOLD_MW and c < agent.CONFIDENCE_THRESHOLD
+    return (
+        _surplus_trigger(step)
+        and not step_anomalies(step)
+        and predict_step(step)[1] < agent.CONFIDENCE_THRESHOLD
+    )
 
 
 def delivered_mw(step: int) -> float:
@@ -442,35 +496,62 @@ def delivered_temperature(step: int, node: Dict[str, Any]) -> Optional[float]:
     return float(snapshot["temp_servere_c"]) + delivered_to_node(step, node) * TEMP_RISE_PER_MW_C
 
 
+def node_thermal_limit(snapshot: Dict[str, Any]) -> float:
+    return min(float(snapshot["limita_termica_c"]), HVAC_LIMIT_C)
+
+
 def thermal_rejected(step: int, node: Dict[str, Any]) -> bool:
     snapshot = datacenter_snapshot(step, node)
     if snapshot is None:
         return False
-    current_temp = float(snapshot["temp_servere_c"])
-    thermal_limit = float(snapshot["limita_termica_c"])
-    if delivered_to_node(step, node) > 0:
-        return delivered_temperature(step, node) > thermal_limit
-    return current_temp >= thermal_limit - THERMAL_SAFETY_MARGIN_C
+    return float(delivered_temperature(step, node)) > node_thermal_limit(snapshot)
 
 
-def offer_capacity(step: int, node: Dict[str, Any], remaining_mw: float) -> float:
+def node_free_capacity(step: int, node: Dict[str, Any]) -> float:
     snapshot = datacenter_snapshot(step, node)
     if snapshot is None:
         return 0.0
-    current_temp = float(snapshot["temp_servere_c"])
-    thermal_limit = float(snapshot["limita_termica_c"])
-    free_capacity = max(0.0, float(snapshot["capacitate_libera_mw"]))
-    if current_temp >= thermal_limit - THERMAL_SAFETY_MARGIN_C:
+    temp = float(delivered_temperature(step, node))
+    free_capacity = max(0.0, float(snapshot["capacitate_libera_mw"]) - delivered_to_node(step, node))
+    thermal_capacity = max(0.0, (node_thermal_limit(snapshot) - temp) / TEMP_RISE_PER_MW_C)
+    return min(free_capacity, thermal_capacity)
+
+
+def offer_capacity(step: int, node: Dict[str, Any], remaining_mw: float) -> float:
+    if thermal_rejected(step, node):
         return 0.0
-    thermal_capacity = max(0.0, (thermal_limit - current_temp) / TEMP_RISE_PER_MW_C)
-    return max(0.0, min(float(remaining_mw), free_capacity, thermal_capacity))
+    return max(0.0, min(float(remaining_mw), node_free_capacity(step, node)))
+
+
+def node_ranking(step: int) -> List[Dict[str, Any]]:
+    basis_mw = remaining_surplus(step) if remaining_surplus(step) > 0.05 else predict_step(step)[0]
+    candidates = []
+    for node in DATACENTERS:
+        snapshot = datacenter_snapshot(step, node)
+        if snapshot is None:
+            continue
+        hist = st.session_state.dc_history[node["id"]]
+        candidates.append(
+            {
+                "id": node["id"],
+                "free_capacity_mw": node_free_capacity(step, node),
+                "temp_c": float(delivered_temperature(step, node)),
+                "thermal_limit_c": node_thermal_limit(snapshot),
+                "offers_sent": hist["offers_sent"],
+                "offers_accepted": hist["offers_accepted"],
+            }
+        )
+    return rank_datacenters(basis_mw, candidates, hvac_max_temp_c=HVAC_LIMIT_C)
 
 
 def build_offer(steps: List[int]) -> Tuple[Optional[Dict[str, Any]], bool]:
     pending_steps = [s for s in steps if step_qualifies(s) and remaining_surplus(s) > 0.05]
     if not pending_steps:
         return None, False
-    for node in ELIGIBLE_NODES:
+    for ranked in node_ranking(pending_steps[0]):
+        if not ranked["eligible"]:
+            continue
+        node = DC_BY_ID[ranked["id"]]
         per_step: Dict[int, float] = {}
         for s in pending_steps:
             if node_open_for_step(s, node):
@@ -482,6 +563,7 @@ def build_offer(steps: List[int]) -> Tuple[Optional[Dict[str, Any]], bool]:
                 "node": node,
                 "per_step": per_step,
                 "total_mwh": round(sum(per_step.values()), 2),
+                "match_score": ranked["match_score"],
             }, False
     return None, True
 
@@ -490,6 +572,9 @@ def _accept_offer(node_id: str, node_label: str, per_step: Dict[int, float]) -> 
     for step, mw in per_step.items():
         st.session_state.deals.setdefault(step, {})[node_id] = mw
     st.session_state.pending_advance = False
+    hist = st.session_state.dc_history[node_id]
+    hist["offers_sent"] += 1
+    hist["offers_accepted"] += 1
     total = sum(per_step.values())
     st.session_state.toast_msg = (
         f"✅ {node_label} a acceptat oferta: {total:.2f} MWh la {FIXED_PRICE_EUR:.0f} €/MWh."
@@ -499,14 +584,20 @@ def _accept_offer(node_id: str, node_label: str, per_step: Dict[int, float]) -> 
 def _refuse_offer(node_id: str, node_label: str, per_step: Dict[int, float]) -> None:
     for step in per_step:
         st.session_state.refused.setdefault(step, set()).add(node_id)
+    st.session_state.dc_history[node_id]["offers_sent"] += 1
     st.session_state.pending_advance = False
     st.session_state.toast_msg = f"⛔ {node_label} a refuzat oferta. Se redirecționează fluxul către următorul nod."
 
 
 def _reset_offers(steps: List[int]) -> None:
     for step in steps:
-        st.session_state.deals.pop(step, None)
-        st.session_state.refused.pop(step, None)
+        for node_id in st.session_state.deals.pop(step, {}):
+            hist = st.session_state.dc_history[node_id]
+            hist["offers_sent"] = max(0, hist["offers_sent"] - 1)
+            hist["offers_accepted"] = max(0, hist["offers_accepted"] - 1)
+        for node_id in st.session_state.refused.pop(step, set()):
+            hist = st.session_state.dc_history[node_id]
+            hist["offers_sent"] = max(0, hist["offers_sent"] - 1)
     st.session_state.pending_advance = False
     st.session_state.toast_msg = "↩️ Ofertele pentru interval au fost resetate."
 
