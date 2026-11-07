@@ -485,12 +485,6 @@ with col_main:
 
     sur_pred = [_dispatched_surplus_for_step(i) if i >= T else None for i in window]
 
-    node_bars: Dict[str, List[float]] = {n["id"]: [] for n in DATACENTERS}
-    for i in window:
-        s_i, c_i, _ = predict_step(i)
-        for a in allocate(s_i, c_i):
-            node_bars[a["id"]].append(a["allocated_mw"])
-
     t_x = row_T["dt"].to_pydatetime()
     live_value = actual_injection_T
     prev_value = _dispatched_inj_for_step(T - 1) if T > 0 else live_value
@@ -518,27 +512,17 @@ with col_main:
     )
 
     fig = go.Figure()
-    for node in DATACENTERS:
-        fig.add_trace(
-            go.Bar(
-                x=xs,
-                y=node_bars[node["id"]],
-                name=f"Absorbit: {node['short']}",
-                marker_color=node["color"],
-                opacity=0.8,
-            )
-        )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=inj_hist, mode="lines", name="Injecție netă PPC (după arbitraj ≤ T)",
-            line=dict(color="#00FF9D", width=2.5, shape="spline", smoothing=0.6),
-            fill="tozeroy", fillcolor="rgba(0,255,157,0.07)",
+            x=xs, y=inj_hist, mode="lines", name="Injecție netă PPC",
+            line=dict(color="#00FF9D", width=2.8, shape="spline", smoothing=0.6),
+            fill="tozeroy", fillcolor="rgba(0,255,157,0.08)",
         )
     )
     if is_accepted:
         fig.add_trace(
             go.Scatter(
-                x=xs, y=inj_raw_hist, mode="lines", name="Producție brută T (fără arbitraj)",
+                x=xs, y=inj_raw_hist, mode="lines", name="Producție brută (fără arbitraj)",
                 line=dict(color="#8E95A5", width=1.5, dash="dot"),
             )
         )
@@ -552,20 +536,14 @@ with col_main:
         )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=inj_fcst, mode="lines", name="Producție prognozată (după pre-rezervare T..T+4)",
-            line=dict(color="#38BDF8", width=2, dash="dash", shape="spline", smoothing=0.6),
+            x=xs, y=inj_fcst, mode="lines", name="Producție prognozată (T..T+4)",
+            line=dict(color="#38BDF8", width=2.2, dash="dash", shape="spline", smoothing=0.6),
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=sur_pred, mode="lines+markers", name="Surplus prognozat rămas",
-            line=dict(color="#F59E0B", width=2, dash="dot"), marker=dict(size=6),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=xs, y=limit_line, mode="lines", name="Limită linie PPC",
-            line=dict(color="#FF4B4B", width=2),
+            x=xs, y=limit_line, mode="lines", name="Limită linie PPC (10 MW)",
+            line=dict(color="#FF4B4B", width=2.5),
         )
     )
     # Punctul "live" de la capătul curbei, ca ultimul preț pe un terminal de bursă
@@ -583,7 +561,7 @@ with col_main:
         annotation_bgcolor=tick_color,
     )
     fig.add_vrect(
-        x0=t_x, x1=t_x + timedelta(hours=LOOKAHEAD_HOURS), fillcolor="rgba(142,149,165,0.12)", line_width=0,
+        x0=t_x, x1=t_x + timedelta(hours=LOOKAHEAD_HOURS), fillcolor="rgba(142,149,165,0.08)", line_width=0,
         annotation_text="PROGNOZĂ ML", annotation_position="top left",
         annotation_font=dict(color="#F59E0B", size=11),
     )
@@ -617,12 +595,12 @@ with col_main:
                 bgcolor="#12141b", bordercolor="#FF4B4B",
             )
     fig.update_layout(
-        barmode="stack",
+        showlegend=False,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="JetBrains Mono, monospace", color="#8E95A5", size=11),
-        height=430,
-        margin=dict(l=10, r=60, t=40, b=10),
+        height=580,
+        margin=dict(l=10, r=60, t=30, b=10),
         hovermode="x unified",
         uirevision="voltcompute-live",
         xaxis=dict(
@@ -635,7 +613,6 @@ with col_main:
             gridcolor="rgba(255,255,255,0.05)", zerolinecolor="rgba(255,255,255,0.1)",
             showspikes=True, spikecolor="rgba(255,255,255,0.35)", spikethickness=1, spikedash="dot",
         ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0, font=dict(size=10)),
     )
     st.plotly_chart(fig, width="stretch")
 
