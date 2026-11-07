@@ -40,21 +40,18 @@ DATACENTERS: List[Dict[str, Any]] = [
         "id": "DC_AI_BUCURESTI",
         "name": "AI Data Center București",
         "short": "AI București",
-        "queue": 45,
         "color": "#00FF9D",
     },
     {
         "id": "DC_CLOUD_CLUJ",
         "name": "Cloud Data Center Cluj",
         "short": "Cloud Cluj",
-        "queue": 20,
         "color": "#38BDF8",
     },
     {
         "id": "DC_EDGE_TIMISOARA",
         "name": "Edge Data Center Timișoara",
         "short": "Edge Timișoara",
-        "queue": 30,
         "color": "#FF4B4B",
     },
 ]
@@ -346,11 +343,8 @@ def predict_step(v_idx: int) -> Tuple[float, float, Dict[str, float], float]:
 # =====================================================================
 # MOTORUL DE OFERTE PE DATA CENTRE (SECVENȚIAL, CU REFUZ -> URMĂTORUL NOD)
 # =====================================================================
-# Ordinea ofertării este stabilă, iar eligibilitatea se verifică dinamic pentru fiecare oră.
-ELIGIBLE_NODES: List[Dict[str, Any]] = sorted(
-    DATACENTERS,
-    key=lambda n: -n["queue"],
-)
+# Eligibilitatea se verifică dinamic pentru fiecare oră; ordinea se calculează în build_offer().
+ELIGIBLE_NODES: List[Dict[str, Any]] = list(DATACENTERS)
 
 
 def step_qualifies(step: int) -> bool:
@@ -436,14 +430,19 @@ def offer_capacity(step: int, node: Dict[str, Any], remaining_mw: float) -> floa
 
 def build_offer(steps: List[int]) -> Tuple[Optional[Dict[str, Any]], bool]:
     """
-    Alege oferta curentă: primul data center eligibil (după prioritate) care nu a răspuns încă.
+    Alege oferta curentă: data center-ul cu cea mai mare capacitate disponibilă la primul pas ofertat.
     Returnează (oferta, epuizat). `epuizat=True` înseamnă că a mai rămas surplus necontractat
     și nu mai există niciun data center disponibil căruia să i se trimită oferta.
     """
     pending_steps = [s for s in steps if step_qualifies(s) and remaining_surplus(s) > 0.05]
     if not pending_steps:
         return None, False
-    for node in ELIGIBLE_NODES:
+    ordered_nodes = sorted(
+        ELIGIBLE_NODES,
+        key=lambda node: offer_capacity(pending_steps[0], node, float("inf")),
+        reverse=True,
+    )
+    for node in ordered_nodes:
         per_step: Dict[int, float] = {}
         for s in pending_steps:
             if node_open_for_step(s, node):
@@ -976,11 +975,6 @@ with col_dc:
         client_savings = total_mwh * savings_per_mwh
         full_price_cost = total_mwh * REFERENCE_TARIFF_EUR
         offer_cost = total_mwh * FIXED_PRICE_EUR
-        first_snapshot = datacenter_snapshot(first_step, node)
-        capacity_basis = float(first_snapshot["capacitate_libera_mw"]) if first_snapshot else 0.0
-        jobs_started = max(1, int(round(node["queue"] * avg_mw / max(capacity_basis, 0.01))))
-        queue_after = [n["short"] for n in ELIGIBLE_NODES if n["id"] != node["id"] and node_open_for_step(first_step, n)]
-        queue_txt = " → ".join(queue_after) if queue_after else "niciun alt data center"
 
         st.markdown(
             f"""
@@ -996,9 +990,7 @@ with col_dc:
     💶 <b>Plătiți:</b> <span class="vc-mono">{offer_cost:,.2f} €</span>
     <span style="color:#8E95A5;">(la preț întreg ar fi fost {full_price_cost:,.2f} €)</span>
     <br>
-    🖥️ <b>Joburi din coadă care pornesc:</b> <span class="vc-mono" style="color:#38BDF8;">{jobs_started}/{node['queue']}</span>
-    <br>
-    <span style="color:#8E95A5;font-size:0.8rem;">Dacă refuzați, oferta trece la: {queue_txt}</span>
+    <span style="color:#8E95A5;font-size:0.8rem;">Dacă refuzați, oferta trece la data center-ul cu următoarea capacitate disponibilă.</span>
   </div>
 </div>
 """,
