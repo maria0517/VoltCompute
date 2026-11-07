@@ -24,7 +24,7 @@ SCENARIO_DESCRIPTIONS: Dict[str, str] = {
     ),
     "DATACENTER_THERMAL_RISK": (
         "Zi caniculară cu surplus solar ridicat, însă sistemul de răcire al centrului de cercetare suferă o avarie "
-        "parțială și atinge 28.5°C la prânz (> 25.0°C). Agentul blochează transferul energetic pentru protecția "
+        "parțială și atinge 28.5°C la prânz (> 26.0°C, limita HVAC). Agentul blochează transferul energetic pentru protecția "
         "termică a serverelor."
     ),
 }
@@ -105,7 +105,7 @@ class VoltComputeSimulator:
                     irr = float(sunny_irradiance[hour] * 1.03)
                     ambient_temp = 35.5
                     da_price = 8.0
-                    cooling_temp = 28.5  # Peste limita de 25.0°C -> blocare alocare (NORMAL_GRID_OPERATION)
+                    cooling_temp = 28.5  # Peste limita HVAC de 26.0°C -> blocare alocare (NORMAL_GRID_OPERATION)
                     max_absorb_mw = 6.5
                     pending_jobs = 25
                     stability_idx = 0.93
@@ -182,7 +182,7 @@ class VoltComputeSimulator:
 
         offers_count = sum(1 for d in parsed_decisions if d.status == "OFFER_GENERATED")
         escalations_count = sum(
-            1 for d in parsed_decisions if d.status == "ESCALATE_TO_HUMAN"
+            1 for d in parsed_decisions if d.status in ("ESCALATE_TO_HUMAN", "UNCERTAIN")
         )
 
         return {

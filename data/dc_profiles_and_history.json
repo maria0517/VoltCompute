@@ -1,0 +1,34 @@
+{
+  "_comment": "Profilurile Data Center-elor + istoricul ofertelor folosit de routerul determinist (services/router.py). Istoricul de pornire (offers_sent / offers_accepted) este simulat pentru demo; în sesiune este actualizat la fiecare Aprobă / Refuză.",
+  "fixed_tariff_eur_mwh": 30.0,
+  "hvac_max_temp_c": 26.0,
+  "datacenters": [
+    {
+      "id": "DC_AI_BUCURESTI",
+      "name": "AI Data Center București",
+      "short": "AI București",
+      "workload": "Antrenare LLM / GPU",
+      "queue": 45,
+      "color": "#00FF9D",
+      "history": {"offers_sent": 40, "offers_accepted": 34}
+    },
+    {
+      "id": "DC_CLOUD_CLUJ",
+      "name": "Cloud Data Center Cluj",
+      "short": "Cloud Cluj",
+      "workload": "Randări / batch CPU",
+      "queue": 20,
+      "color": "#38BDF8",
+      "history": {"offers_sent": 40, "offers_accepted": 26}
+    },
+    {
+      "id": "DC_EDGE_TIMISOARA",
+      "name": "Edge Data Center Timișoara",
+      "short": "Edge Timișoara",
+      "workload": "Backup-uri masive",
+      "queue": 30,
+      "color": "#FF4B4B",
+      "history": {"offers_sent": 40, "offers_accepted": 31}
+    }
+  ]
+}
