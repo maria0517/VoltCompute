@@ -56,6 +56,7 @@ ENGINEERED_FEATURE_COLUMNS = [
 
 FEATURE_COLUMNS = ENGINEERED_FEATURE_COLUMNS
 TARGET_COLUMN = "surplus_mw"
+PERSISTENCE_HORIZON_H = 2  # Orizontul de anticipare: t+2h
 
 
 def _build_gradient_boosting_regressor(seed: int = 42, max_depth: int = 4) -> Tuple[Any, str]:
@@ -322,7 +323,15 @@ def train_pipeline() -> dict:
     y_test = test_df[TARGET_COLUMN]
     y_test_inj = test_df["net_injection_mw"]
 
-    # 1. Baseline: DummyRegressor (media istorică din setul de antrenare)
+    # 1a. Baseline OBLIGATORIU: Persistență naivă  ŷ(t+2) = y(t)
+    #     (surplusul măsurat acum este „prognoza” pentru peste 2 ore). Primele 2 ore din setul
+    #     de test folosesc ultimele 2 ore din train (continuitate cronologică, fără leakage din viitor).
+    y_full = pd.concat([y_train, y_test], ignore_index=True)
+    y_pred_persist = y_full.shift(PERSISTENCE_HORIZON_H).iloc[len(y_train):].to_numpy()
+    persist_mae = float(mean_absolute_error(y_test, y_pred_persist))
+    persist_rmse = float(root_mean_squared_error(y_test, y_pred_persist))
+
+    # 1b. Baseline secundar: DummyRegressor (media istorică din setul de antrenare)
     baseline = DummyRegressor(strategy="mean")
     baseline.fit(X_train, y_train)
     y_pred_base = baseline.predict(X_test)
@@ -358,12 +367,19 @@ def train_pipeline() -> dict:
     uncertainty_model, _ = _build_gradient_boosting_regressor(seed=42, max_depth=3)
     uncertainty_model.fit(X_train, train_abs_residuals)
 
+    # Îmbunătățirea se raportează față de baseline-ul obligatoriu (Persistență t+2)
     mae_improvement_pct = (
-        ((base_mae - xgb_mae) / base_mae) * 100.0 if base_mae > 0 else 0.0
+        ((persist_mae - xgb_mae) / persist_mae) * 100.0 if persist_mae > 0 else 0.0
     )
     rmse_improvement_pct = (
-        ((base_rmse - xgb_rmse) / base_rmse) * 100.0 if base_rmse > 0 else 0.0
+        ((persist_rmse - xgb_rmse) / persist_rmse) * 100.0 if persist_rmse > 0 else 0.0
     )
+
+    # Statistici senzori din setul de antrenare -> detecție anomalii > 3σ la runtime (Status UNCERTAIN)
+    sensor_stats = {
+        col: {"mean": round(float(train_df[col].mean()), 4), "std": round(float(train_df[col].std()), 4)}
+        for col in ("solar_irradiance_wm2", "ambient_temp_celsius", "day_ahead_price_eur")
+    }
 
     if hasattr(gb_model, "feature_importances_"):
         feature_importances = {
@@ -421,6 +437,7 @@ def train_pipeline() -> dict:
         "feature_columns": ENGINEERED_FEATURE_COLUMNS,
         "base_feature_columns": BASE_FEATURE_COLUMNS,
         "feature_importances": feature_importances,
+        "sensor_stats": sensor_stats,
         "historical_cases_bank": historical_cases_bank,
         "test_metrics": test_summary,
         "trained_at": datetime.now().isoformat(),
@@ -436,7 +453,18 @@ def train_pipeline() -> dict:
         "dataset_rows": int(len(train_df) + len(test_df)),
         "train_rows": int(len(X_train)),
         "test_rows": int(len(X_test)),
-        "split_strategy": "Strict separate files: train_energy_data.csv (1152h) vs live_test_energy_data.csv (288h unseen)",
+        "split_strategy": (
+            "Temporal split strict 80/20: train_energy_data.csv (primele 1152h cronologic) vs "
+            "live_test_energy_data.csv (ultimele 288h, nevăzute la antrenare, fără shuffle)"
+        ),
+        "forecast_setup": (
+            "Surplusul la ora țintă t+2 este prezis din prognoza meteo/PZU pentru ora t+2; "
+            "baseline-ul de persistență folosește surplusul măsurat la ora t."
+        ),
+        "baseline_persistence_t_plus_2": {
+            "mae": round(persist_mae, 4),
+            "rmse": round(persist_rmse, 4),
+        },
         "baseline_dummy": {
             "mae": round(base_mae, 4),
             "rmse": round(base_rmse, 4),
@@ -467,10 +495,15 @@ def train_pipeline() -> dict:
     print(f"\n=== Rezultate Antrenare VoltCompute ({model_type_name}) ===")
     print(f"Set Antrenare     -> {TRAIN_DATA_PATH} ({len(X_train)} ore)")
     print(f"Set Date Noi Live -> {LIVE_TEST_DATA_PATH} ({len(X_test)} ore nevăzute la antrenare)")
-    print(f"Baseline (Dummy)  -> MAE: {base_mae:.4f} MW | RMSE: {base_rmse:.4f} MW")
+    print("-" * 78)
+    print(f"{'Model':<34}{'MAE (MW)':>14}{'RMSE (MW)':>14}")
+    print(f"{'Baseline Persistență ŷ(t+2)=y(t)':<34}{persist_mae:>14.4f}{persist_rmse:>14.4f}")
+    print(f"{'Baseline Dummy (media train)':<34}{base_mae:>14.4f}{base_rmse:>14.4f}")
+    print(f"{model_type_name[:33]:<34}{xgb_mae:>14.4f}{xgb_rmse:>14.4f}")
+    print("-" * 78)
     print(f"Model Surplus     -> MAE: {xgb_mae:.4f} MW | RMSE: {xgb_rmse:.4f} MW | R²: {xgb_r2:.4f} (Ziua MAE: {daytime_surplus_mae:.3f} MW)")
     print(f"Model Injecție    -> MAE: {inj_mae:.4f} MW | RMSE: {inj_rmse:.4f} MW | R²: {inj_r2:.4f} (Ziua MAE: {daytime_inj_mae:.3f} MW)")
-    print(f"Îmbunătățire MAE  -> {mae_improvement_pct:.2f}%")
+    print(f"Reducere eroare vs Persistență -> MAE: {mae_improvement_pct:.2f}% | RMSE: {rmse_improvement_pct:.2f}%")
     print(f"Model salvat în   -> {MODEL_PATH}\n")
 
     return metrics

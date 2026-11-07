@@ -82,6 +82,7 @@ DecisionStatus = Literal[
     "OFFER_GENERATED",
     "NORMAL_GRID_OPERATION",
     "ESCALATE_TO_HUMAN",
+    "UNCERTAIN",
     "DATA_ERROR",
 ]
 
