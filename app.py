@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 FIXED_PRICE_EUR = 30.0
-LOOKAHEAD_HOURS = 4
+LOOKAHEAD_HOURS = 2
 HISTORY_HOURS = 24
 REFERENCE_TARIFF_EUR = VoltComputeSimulator.STANDARD_RETAIL_PRICE_EUR
 AUTOPLAY_SECONDS = 1.0
@@ -458,7 +458,21 @@ future_surplus = {i: predict_step(i)[0] for i in future_idx}
 upcoming_spikes = [i for i in future_idx if predict_step(i)[0] > agent.MIN_SURPLUS_THRESHOLD_MW]
 has_upcoming_spike = len(upcoming_spikes) > 0
 first_spike_idx = upcoming_spikes[0] if has_upcoming_spike else None
-is_first_spike_prebooked = (st.session_state.accepted.get(first_spike_idx) == "ACCEPTED") if first_spike_idx is not None else False
+
+if has_upcoming_spike:
+    lead_h = first_spike_idx - T
+    spike_start_dt = _ring_dt(first_spike_idx)
+    spike_end_dt = _ring_dt(upcoming_spikes[-1] + 1)
+    start_str = spike_start_dt.strftime("%H:%M")
+    end_str = spike_end_dt.strftime("%H:%M")
+    window_mw = round(sum(sum(a["allocated_mw"] for a in allocate(predict_step(si)[0], predict_step(si)[1])) for si in upcoming_spikes), 2)
+    window_revenue = round(window_mw * FIXED_PRICE_EUR, 2)
+    is_window_bought = all(st.session_state.accepted.get(si) == "ACCEPTED" for si in upcoming_spikes)
+else:
+    lead_h = 0
+    start_str, end_str = "", ""
+    window_mw, window_revenue = 0.0, 0.0
+    is_window_bought = False
 
 peak_candidates = [(T, surplus_T)] + [(i, s) for i, s in future_surplus.items()]
 peak_idx, peak_mw = max(peak_candidates, key=lambda x: x[1])
@@ -471,20 +485,17 @@ if is_accepted and total_alloc_T > 0:
         f'Profit PPC: +{actual_profit_T:,.2f} €</div>'
     )
 elif has_upcoming_spike and total_alloc_T == 0:
-    s_lead = predict_step(first_spike_idx)[0]
-    lead_h = first_spike_idx - T
-    t_lead_str = _ring_dt(first_spike_idx).strftime("%H:%M")
-    if is_first_spike_prebooked:
+    if is_window_bought:
         alert_html = (
-            f'<div class="vc-alert vc-alert-green">✅ PRE-DISPECERIZARE ACTIVĂ (T+{lead_h}): '
-            f'Vârful de {s_lead:.1f} MW de la ora {t_lead_str} (în {lead_h}h) este deja PRE-REZERVAT! '
-            f'Capacitatea academică e alocată, iar prognoza e stabilizată în siguranță sub 10 MW.</div>'
+            f'<div class="vc-alert vc-alert-green">✅ OFERTĂ CONTRACTATĂ ÎN AVANS (T+{lead_h}h): '
+            f'Surplusul prognozat de {window_mw:.1f} MW în intervalul {start_str} – {end_str} '
+            f'este deja cumpărat de UPB! Rețeaua este securizată sub 10 MW.</div>'
         )
     else:
         alert_html = (
-            f'<div class="vc-alert vc-alert-red">🔔 PREAVIZ CURTAILMENT (T+{lead_h}h): '
-            f'Modelul AI prognozează un spike critic de {s_lead:.1f} MW la ora {t_lead_str} '
-            f'(peste limita liniei de {grid_limit_mw:.0f} MW) · Rezervă capacitatea universitară cu 2 ore înainte!</div>'
+            f'<div class="vc-alert vc-alert-red">🔔 OFERTĂ DISPONIBILĂ PENTRU DATA CENTERS (T+{lead_h}h): '
+            f'Modelul AI prognozează un surplus de {window_mw:.1f} MW în intervalul {start_str} – {end_str} '
+            f'(peste limita liniei de {grid_limit_mw:.0f} MW) · Data center-ul poate cumpăra energia în avans cu {lead_h} ore!</div>'
         )
 elif peak_mw > 0.05:
     alert_html = (
@@ -630,11 +641,11 @@ with col_main:
                 line=dict(color="#8E95A5", width=1.5, dash="dot"),
             )
         )
-    any_future_prebooked = any(st.session_state.accepted.get(i) == "ACCEPTED" for i in future_idx)
-    if any_future_prebooked:
+    any_future_bought = any(st.session_state.accepted.get(i) == "ACCEPTED" for i in future_idx)
+    if any_future_bought:
         fig.add_trace(
             go.Scatter(
-                x=xs, y=inj_raw_fcst, mode="lines", name="Prognoză AI brută (vârf nepreluat)",
+                x=xs, y=inj_raw_fcst, mode="lines", name="Prognoză AI brută (vârf necontractat)",
                 line=dict(color="#F87171", width=1.5, dash="dot"),
             )
         )
@@ -685,7 +696,7 @@ with col_main:
         if st.session_state.accepted.get(f_i) == "ACCEPTED":
             fig.add_annotation(
                 x=f_dt, y=limit_line[window.index(f_i)],
-                text=f"✅ T+{f_i - T} REZERVAT",
+                text=f"✅ T+{f_i - T} CUMPĂRAT",
                 showarrow=True, arrowhead=2, arrowcolor="#00FF9D",
                 font=dict(color="#00FF9D", size=10),
                 bgcolor="#12141b", bordercolor="#00FF9D",
@@ -762,17 +773,10 @@ with col_modal:
 
     # CAZUL 1: Există surplus activ la ora curentă T
     if total_alloc_T > 0:
-        window_hours = 1
-        for i in future_idx:
-            if future_surplus[i] > agent.MIN_SURPLUS_THRESHOLD_MW:
-                window_hours += 1
-            else:
-                break
-
         status_card = (
-            '<div style="color:#00FF9D;font-weight:700;">● TRANZACȚIE PRE-REZERVATĂ (REȚEA STABILIZATĂ)</div>'
+            '<div style="color:#00FF9D;font-weight:700;">● TRANZACȚIE CONFIRMATĂ (REȚEA STABILIZATĂ)</div>'
             if is_accepted
-            else '<div style="color:#F59E0B;font-weight:700;">⚠️ OFERTĂ DISPONIBILĂ PENTRU PRE-REZERVARE</div>'
+            else '<div style="color:#F59E0B;font-weight:700;">⚠️ OFERTĂ ACTIVĂ LA ORA CURENTĂ</div>'
         )
 
         st.markdown(
@@ -786,7 +790,7 @@ with col_modal:
     PPC redirecționează <span class="vc-mono" style="color:#00FF9D;">{total_alloc_T:.2f} MW</span> surplus către nodurile academice la
     <span class="vc-mono" style="color:#00FF9D;">{FIXED_PRICE_EUR:.2f} €/MWh</span>.
     <br><br>
-    💰 <b>Profit la livrare:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{revenue_T:,.2f} €</span>
+    💰 <b>Profit PPC:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{revenue_T:,.2f} €</span>
     <br>
     📉 <b>Degrevare linie PPC:</b> <span class="vc-mono" style="color:#38BDF8;">-{total_alloc_T:.2f} MW</span> (curentul scade sub 10 MW)
   </div>
@@ -798,87 +802,62 @@ with col_modal:
         if is_accepted:
             k1.metric("Profit Încasat", f"+{revenue_T:,.2f} €", delta="Curent livrat")
             k2.metric("Degrevare Curent", f"-{total_alloc_T:.2f} MW", delta="Rețea stabilă")
+            st.success(f"✅ Tranzacție efectuată! +{revenue_T:,.2f} € profit încasat, surplus evacuat: {total_alloc_T:.2f} MW.")
         else:
-            k1.metric("Profit la Livrare", f"+{revenue_T:,.2f} €", delta="În așteptare")
+            k1.metric("Profit Potențial", f"+{revenue_T:,.2f} €", delta="Disponibil")
             k2.metric("Surplus de Evacuat", f"{total_alloc_T:.2f} MW", delta="Depășire linie", delta_color="inverse")
-
-        if is_accepted:
-            st.success(f"✅ Curent livrat! +{revenue_T:,.2f} € profit încasat, surplus evacuat: {total_alloc_T:.2f} MW.")
-        else:
-            if st.button(f"⚡ Rezervă energia în avans (+{revenue_T:,.2f} €)", key=f"book_{T}", type="primary", width="stretch"):
+            if st.button(f"⚡ Cumpără surplusul de energie (+{revenue_T:,.2f} €)", key=f"buy_now_{T}", type="primary", width="stretch"):
                 st.session_state.accepted[T] = "ACCEPTED"
-                st.toast("✅ Energia a fost rezervată în avans. Profitul se încasează la livrare.")
+                st.toast(f"✅ Energia a fost cumpărată cu succes! (+{revenue_T:,.2f} €)")
                 st.rerun()
 
-        # Posibilitate de pre-rezervare și pentru un vârf viitor
-        if has_upcoming_spike:
-            spike_dt = _ring_dt(first_spike_idx)
-            lead_h = first_spike_idx - T
-            s_spike, c_spike, _, _ = predict_step(first_spike_idx)
-            allocs_spike = allocate(s_spike, c_spike)
-            alloc_spike_mw = round(sum(a["allocated_mw"] for a in allocs_spike), 2)
-            profit_spike = round(alloc_spike_mw * FIXED_PRICE_EUR, 2)
-            is_spike_prebooked = (st.session_state.accepted.get(first_spike_idx) == "ACCEPTED")
-
-            st.markdown('<hr style="border-color:rgba(255,255,255,0.08);margin:12px 0;">', unsafe_allow_html=True)
-            st.markdown(f'<div class="vc-sub">🔮 PRE-DISPECERIZARE VIITOR (T+{lead_h}h · {spike_dt.strftime("%H:%M")})</div>', unsafe_allow_html=True)
-            if is_spike_prebooked:
-                st.success(f"✅ Vârf {spike_dt.strftime('%H:%M')} (+{profit_spike:,.2f} €) deja pre-rezervat.")
-            else:
-                if st.button(f"⚡ Pre-rezervă și Vârful T+{lead_h}h ({spike_dt.strftime('%H:%M')}) (+{profit_spike:,.2f} €)", key=f"book_next_{first_spike_idx}", width="stretch"):
-                    st.session_state.accepted[first_spike_idx] = "ACCEPTED"
-                    st.toast(f"✅ Vârf viitor pre-rezervat pentru {spike_dt.strftime('%H:%M')}!")
-                    st.rerun()
-
-    # CAZUL 2: La ora curentă T nu e surplus, DAR urmează un spike în lookahead (T+2)
+    # CAZUL 2: La ora curentă T nu e surplus, DAR urmează o fereastră de surplus în viitor (T+2.. / T+1..)
     elif has_upcoming_spike:
-        spike_dt = _ring_dt(first_spike_idx)
-        lead_h = first_spike_idx - T
-        s_spike, c_spike, _, _ = predict_step(first_spike_idx)
-        allocs_spike = allocate(s_spike, c_spike)
-        alloc_spike_mw = round(sum(a["allocated_mw"] for a in allocs_spike), 2)
-        profit_spike = round(alloc_spike_mw * FIXED_PRICE_EUR, 2)
-        is_spike_prebooked = (st.session_state.accepted.get(first_spike_idx) == "ACCEPTED")
-
         status_card = (
-            '<div style="color:#00FF9D;font-weight:700;">● PRE-REZERVARE ACTIVĂ (VÂRF TĂIAT ÎN AVANS)</div>'
-            if is_spike_prebooked
-            else f'<div style="color:#F59E0B;font-weight:700;">⚠️ PREAVIZ DE REȚEA: SPIKE PESTE {lead_h} ORE</div>'
+            f'<div style="color:#00FF9D;font-weight:700;">● OFERTĂ CUMPĂRATĂ ÎN AVANS (INTERVAL {start_str} – {end_str})</div>'
+            if is_window_bought
+            else f'<div style="color:#F59E0B;font-weight:700;">⚡ OFERTĂ DISPONIBILĂ PENTRU DATA CENTERS ({start_str} – {end_str})</div>'
         )
 
         st.markdown(
             f"""
 <div class="vc-modal">
-  <div class="vc-modal-head">🔔 PRE-DISPECERIZARE ANTICIPATĂ // LOOKAHEAD T+{lead_h}h</div>
-  <div class="vc-modal-title">SPIKE SOLAR PROGNOZAT LA {spike_dt.strftime('%H:%M')}</div>
+  <div class="vc-modal-head">🔔 OFERTĂ ENERGIE ÎN AVANS (PENTRU DATA CENTERS) // LIVRARE ÎN {lead_h} ORE</div>
+  <div class="vc-modal-title">DISPONIBILITATE SURPLUS: {start_str} – {end_str}</div>
   <div class="vc-modal-body">
     {status_card}
     <br>
-    Modelul AI prognozează un surplus critic de <span class="vc-mono" style="color:#FF7B7B;">{s_spike:.2f} MW</span>
-    la ora <span class="vc-mono" style="color:#FFFFFF;">{spike_dt.strftime('%H:%M')}</span> (în {lead_h} ore), depășind limita liniei de 10 MW!
+    👋 <b>Hei!</b> La ora <span class="vc-mono" style="color:#00FF9D;font-weight:700;">{start_str} – {end_str}</span> vă putem oferi energie verde:
+    modelul AI prognozează un surplus de <span class="vc-mono" style="color:#FF7B7B;">{window_mw:.2f} MW</span> depășind limita liniei de 10 MW.
     <br><br>
-    ⚡ <b>De ce rezervăm cu 2 ore înainte?</b><br>
-    Permite clusterului UPB să coboare temperatura camerelor de servere și să aloce nodurile Slurm în avans, fără șoc termic.
+    ⚡ <b>De ce încheiem acordul cu 2 ore înainte?</b><br>
+    Permite clusterului UPB să coboare temperatura camerelor de servere și să pre-aloce nodurile Slurm în avans, fără șoc termic.
     <br><br>
-    💰 <b>Valoare la livrare:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{profit_spike:,.2f} €</span>
+    💰 <b>Valoare energie ({start_str}–{end_str}):</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{window_revenue:,.2f} €</span>
     <br>
-    📉 <b>Degrevare viitoare prognozată:</b> <span class="vc-mono" style="color:#38BDF8;">-{alloc_spike_mw:.2f} MW</span> (vârf tăiat în avans)
+    📉 <b>Degrevare linie PPC:</b> <span class="vc-mono" style="color:#38BDF8;">-{window_mw:.2f} MW</span> (vârf tăiat în avans)
   </div>
 </div>
 """,
             unsafe_allow_html=True,
         )
         k1, k2 = st.columns(2)
-        if is_spike_prebooked:
-            k1.metric(f"Profit la Livrare ({spike_dt.strftime('%H:%M')})", f"+{profit_spike:,.2f} €", delta="Rezervat ✅")
-            k2.metric(f"Vârf Tăiat ({spike_dt.strftime('%H:%M')})", f"-{alloc_spike_mw:.2f} MW", delta="Sub 10 MW ✅")
-            st.success(f"✅ Vârf rezervat pentru ora {spike_dt.strftime('%H:%M')}! Curba din grafic este tăiată în avans.")
+        if is_window_bought:
+            k1.metric(f"Profit Securizat ({start_str}-{end_str})", f"+{window_revenue:,.2f} €", delta="Cumpărat ✅")
+            k2.metric(f"Vârf Tăiat ({start_str}-{end_str})", f"-{window_mw:.2f} MW", delta="Sub 10 MW ✅")
+            st.success(f"✅ Ofertă acceptată! Energia a fost cumpărată în avans pentru intervalul {start_str} – {end_str}. Curba din grafic este securizată.")
+            if st.button(f"↩️ Anulează Achiziția în Avans ({start_str} – {end_str})", key=f"reset_win_{first_spike_idx}", width="stretch"):
+                for si in upcoming_spikes:
+                    st.session_state.accepted[si] = None
+                st.toast(f"Achiziție anulată pentru intervalul {start_str} – {end_str}.")
+                st.rerun()
         else:
-            k1.metric("Valoare la Livrare", f"+{profit_spike:,.2f} €", delta=f"La {spike_dt.strftime('%H:%M')}")
-            k2.metric("Spike Prognozat", f"{s_spike:.2f} MW", delta=f"În {lead_h}h", delta_color="inverse")
-            if st.button(f"⚡ Rezervă energia în avans ({spike_dt.strftime('%H:%M')}) (+{profit_spike:,.2f} €)", key=f"book_spike_{first_spike_idx}", type="primary", width="stretch"):
-                st.session_state.accepted[first_spike_idx] = "ACCEPTED"
-                st.toast(f"✅ Energia a fost rezervată în avans pentru ora {spike_dt.strftime('%H:%M')}.")
+            k1.metric("Valoare Contract", f"+{window_revenue:,.2f} €", delta=f"{start_str} – {end_str}")
+            k2.metric("Surplus Total", f"{window_mw:.2f} MW", delta=f"În {lead_h}h", delta_color="inverse")
+            if st.button(f"⚡ Cumpără energia ({start_str} – {end_str}) (+{window_revenue:,.2f} €)", key=f"buy_win_{first_spike_idx}", type="primary", width="stretch"):
+                for si in upcoming_spikes:
+                    st.session_state.accepted[si] = "ACCEPTED"
+                st.toast(f"✅ Energia a fost cumpărată în avans pentru intervalul {start_str} – {end_str}!")
                 st.rerun()
 
     # CAZUL 3: Nici la T și nici în viitorul apropiat nu se prognozează surplus
