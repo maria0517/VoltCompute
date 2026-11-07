@@ -1,1450 +1,611 @@
-import json
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 from agent import VoltComputeAgent
-from schemas import (
-    AgentDecision,
-    DispatchAction,
-    GridTelemetry,
-    ResearchCenterTelemetry,
+from schemas import GridTelemetry
+from simulator import VoltComputeSimulator
+from train import (
+    DATA_PATH,
+    ENGINEERED_FEATURE_COLUMNS,
+    TARGET_COLUMN,
+    add_engineered_features,
+    generate_synthetic_dataset,
 )
-from simulator import SCENARIO_DESCRIPTIONS, VoltComputeSimulator
 
 st.set_page_config(
-    page_title="VOLTCOMPUTE // PPC Dispatch System",
+    page_title="VOLTCOMPUTE // PPC GRID DISPATCH",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
+FIXED_PRICE_EUR = 30.0
+LOOKAHEAD_HOURS = 4
+HISTORY_HOURS = 24
+REFERENCE_TARIFF_EUR = VoltComputeSimulator.STANDARD_RETAIL_PRICE_EUR
+AUTOPLAY_SECONDS = 1.0
+
+DATACENTERS: List[Dict[str, Any]] = [
+    {
+        "id": "ROEDUNET-UPB-BUC",
+        "name": "RoEduNet - UPB AI Cluster (București)",
+        "short": "RoEduNet UPB",
+        "capacity_mw": 6.0,
+        "cooling_c": 20.5,
+        "queue": 45,
+        "color": "#00FF9D",
+    },
+    {
+        "id": "UVT-HPC-TIM",
+        "name": "UVT HPC Center (Timișoara)",
+        "short": "UVT HPC",
+        "capacity_mw": 3.5,
+        "cooling_c": 22.0,
+        "queue": 20,
+        "color": "#38BDF8",
+    },
+    {
+        "id": "IFIN-HH-MAG",
+        "name": "IFIN-HH Nuclear Grid Node (Măgurele)",
+        "short": "IFIN-HH",
+        "capacity_mw": 5.0,
+        "cooling_c": 27.2,
+        "queue": 30,
+        "color": "#FF4B4B",
+    },
+    {
+        "id": "UTCN-HPC-CLJ",
+        "name": "UTCN High-Performance Node (Cluj)",
+        "short": "UTCN HPC",
+        "capacity_mw": 2.5,
+        "cooling_c": 19.8,
+        "queue": 12,
+        "color": "#A78BFA",
+    },
+]
+
 # =====================================================================
-# 1. SWISS CLEAN DARK MODE DESIGN SYSTEM & CUSTOM CSS
+# STYLE
 # =====================================================================
-SWISS_DARK_CSS = """
+st.markdown(
+    """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
-
-:root {
-    --bg-abyssal: #090A0F;
-    --bg-surface: #11131A;
-    --bg-surface-elevated: #161922;
-    --border-subtle: rgba(255, 255, 255, 0.08);
-    --border-hover: rgba(255, 255, 255, 0.16);
-    --text-primary: #F3F4F6;
-    --text-muted: #8E95A5;
-    --accent-green: #00FF9D;
-    --accent-green-dim: rgba(0, 255, 157, 0.14);
-    --accent-red: #FF4B4B;
-    --accent-red-dim: rgba(255, 75, 75, 0.14);
-    --accent-amber: #F59E0B;
-    --accent-amber-dim: rgba(245, 158, 11, 0.15);
-    --accent-blue: #38BDF8;
-    --accent-blue-dim: rgba(56, 189, 248, 0.14);
+#MainMenu, footer, header {visibility: hidden;}
+html, body, .stApp, [data-testid="stAppViewContainer"] {
+    background-color: #0c0d12 !important;
+    color: #E5E7EB;
 }
-
-/* Hide Streamlit Branding & Chrome */
-#MainMenu {visibility: hidden !important;}
-footer {visibility: hidden !important;}
-header {visibility: hidden !important;}
-[data-testid="stToolbar"] {visibility: hidden !important;}
-[data-testid="stDecoration"] {display: none !important;}
-
-/* Global Background & Typography */
-html, body, [data-testid="stAppViewContainer"], .stApp {
-    background-color: var(--bg-abyssal) !important;
-    color: var(--text-primary) !important;
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
-    letter-spacing: -0.02em;
+.block-container {padding-top: 1.2rem; padding-bottom: 1.5rem; max-width: 100%;}
+[data-testid="stMetricValue"], [data-testid="stMetricDelta"] {
+    font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace !important;
 }
-
-.block-container {
-    padding-top: 1.1rem !important;
-    padding-bottom: 1.5rem !important;
-    padding-left: 1.8rem !important;
-    padding-right: 1.8rem !important;
-    max-width: 100% !important;
-}
-
-/* Sidebar Styling */
-[data-testid="stSidebar"] {
-    background-color: var(--bg-surface) !important;
-    border-right: 1px solid var(--border-subtle) !important;
-}
-
-/* Top Navigation & Status Bar */
-.vc-topbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
+[data-testid="stMetric"] {
+    background: #12141b;
+    border: 1px solid rgba(255,255,255,0.08);
     border-radius: 12px;
-    padding: 12px 20px;
-    margin-bottom: 16px;
+    padding: 12px 16px;
 }
-
-.vc-topbar-left {
-    display: flex;
-    align-items: center;
-    gap: 14px;
+[data-testid="stMetricLabel"] {color: #8E95A5;}
+.vc-title {
+    font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+    font-size: 1.25rem; font-weight: 700; letter-spacing: 0.03em; color: #FFFFFF;
 }
-
-.vc-brand {
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 700;
-    font-size: 1.15rem;
-    letter-spacing: 0.04em;
-    color: #FFFFFF;
-    display: flex;
-    align-items: center;
-    gap: 8px;
+.vc-live {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: #00FF9D; margin-right: 8px; animation: vcpulse 1.8s infinite;
 }
-
-.vc-brand-slash {
-    color: var(--accent-green);
-    font-weight: 700;
+@keyframes vcpulse {
+    0% {box-shadow: 0 0 0 0 rgba(0,255,157,0.7);}
+    70% {box-shadow: 0 0 0 8px rgba(0,255,157,0);}
+    100% {box-shadow: 0 0 0 0 rgba(0,255,157,0);}
 }
-
-.vc-status-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    background: rgba(0, 255, 157, 0.08);
-    border: 1px solid rgba(0, 255, 157, 0.28);
-    color: var(--accent-green);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.72rem;
-    font-weight: 600;
-    padding: 4px 11px;
-    border-radius: 999px;
-    letter-spacing: 0.03em;
+.vc-sub {font-family: ui-monospace, Menlo, monospace; font-size: 0.78rem; color: #8E95A5;}
+.vc-alert {
+    border-radius: 10px; padding: 10px 16px; margin: 8px 0 12px 0;
+    font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; font-size: 0.85rem;
 }
-
-.vc-pulse-dot {
-    width: 8px;
-    height: 8px;
-    background-color: var(--accent-green);
-    border-radius: 50%;
-    display: inline-block;
-    animation: pulse 1.8s infinite ease-in-out;
+.vc-alert-red {background: rgba(255,75,75,0.12); border: 1px solid rgba(255,75,75,0.5); color: #FF7B7B;}
+.vc-alert-green {background: rgba(0,255,157,0.07); border: 1px solid rgba(0,255,157,0.3); color: #00FF9D;}
+.vc-modal {
+    background: #14161e; border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 14px; padding: 18px; box-shadow: 0 12px 40px rgba(0,0,0,0.55);
 }
-
-@keyframes pulse {
-    0% {
-        transform: scale(0.92);
-        box-shadow: 0 0 0 0 rgba(0, 255, 157, 0.75);
-    }
-    70% {
-        transform: scale(1.08);
-        box-shadow: 0 0 0 7px rgba(0, 255, 157, 0);
-    }
-    100% {
-        transform: scale(0.92);
-        box-shadow: 0 0 0 0 rgba(0, 255, 157, 0);
-    }
+.vc-modal-head {
+    font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+    font-size: 0.78rem; color: #38BDF8; letter-spacing: 0.06em; margin-bottom: 10px;
 }
-
-.vc-topbar-right {
-    display: flex;
-    align-items: center;
-    gap: 10px;
+.vc-modal-title {font-size: 1.05rem; font-weight: 700; color: #FFFFFF; margin-bottom: 8px;}
+.vc-modal-body {font-size: 0.88rem; color: #D1D5DB; line-height: 1.5;}
+.vc-mono {font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;}
+.vc-ticker {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; margin: 2px 0 4px 0;
 }
-
-.vc-meta-badge {
-    background: var(--bg-surface-elevated);
-    border: 1px solid var(--border-subtle);
-    color: var(--text-muted);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.74rem;
-    padding: 5px 11px;
-    border-radius: 8px;
+.vc-ticker-price {font-size: 1.9rem; font-weight: 700; letter-spacing: -0.02em;}
+.vc-ticker-meta {font-size: 0.78rem; color: #8E95A5;}
+.vc-badge-live {
+    display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: 0.72rem;
+    font-weight: 700; letter-spacing: 0.08em; margin-right: 10px;
+    background: rgba(255,75,75,0.16); color: #FF4B4B; border: 1px solid rgba(255,75,75,0.5);
+    animation: vcpulse 1.4s infinite;
 }
-
-.vc-meta-badge strong {
-    color: var(--text-primary);
-}
-
-/* Bento Surface Cards */
-.bento-card {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
-    border-radius: 12px;
-    padding: 16px;
-    margin-bottom: 12px;
-    transition: border-color 0.15s ease;
-}
-
-.bento-card:hover {
-    border-color: var(--border-hover);
-}
-
-.bento-section-title {
-    font-family: 'Inter', sans-serif;
-    font-size: 0.72rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-muted);
-    margin-bottom: 12px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
-
-/* Telemetry Micro-Cards (Left Panel) */
-.telemetry-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-    margin-bottom: 12px;
-}
-
-.micro-card {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
-    border-radius: 12px;
-    padding: 12px 14px;
-}
-
-.micro-label {
-    font-size: 0.71rem;
-    font-weight: 500;
-    color: var(--text-muted);
-    margin-bottom: 5px;
-    letter-spacing: -0.01em;
-}
-
-.micro-value {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1.22rem;
-    font-weight: 700;
-    color: var(--text-primary);
-    line-height: 1.15;
-}
-
-.micro-sub {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.68rem;
-    margin-top: 4px;
-}
-
-/* Hero Decision Banners (Center Panel) */
-.hero-banner {
-    border-radius: 12px;
-    padding: 22px 24px;
-    margin-bottom: 14px;
-    position: relative;
-    overflow: hidden;
-}
-
-.hero-offer {
-    background: linear-gradient(135deg, rgba(0, 255, 157, 0.11) 0%, rgba(17, 19, 26, 0.96) 100%);
-    border: 1px solid rgba(0, 255, 157, 0.45);
-    box-shadow: 0 0 25px rgba(0, 255, 157, 0.15);
-}
-
-.hero-escalate {
-    background: linear-gradient(135deg, rgba(245, 158, 11, 0.14) 0%, rgba(17, 19, 26, 0.96) 100%);
-    border: 1px solid rgba(245, 158, 11, 0.55);
-    box-shadow: 0 0 22px rgba(245, 158, 11, 0.12);
-}
-
-.hero-thermal {
-    background: linear-gradient(135deg, rgba(255, 75, 75, 0.14) 0%, rgba(17, 19, 26, 0.96) 100%);
-    border: 1px solid rgba(255, 75, 75, 0.55);
-    box-shadow: 0 0 22px rgba(255, 75, 75, 0.14);
-}
-
-.hero-normal {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
-}
-
-.hero-tag {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    margin-bottom: 8px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.hero-headline {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1.55rem;
-    font-weight: 700;
-    letter-spacing: -0.03em;
-    line-height: 1.2;
-    margin-bottom: 10px;
-}
-
-.hero-meta-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 18px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.78rem;
-    color: var(--text-muted);
-    border-top: 1px solid rgba(255, 255, 255, 0.07);
-    padding-top: 12px;
-    margin-top: 12px;
-}
-
-/* SHAP Horizontal Micro-Bars (Right Panel) */
-.shap-row {
-    margin-bottom: 11px;
-}
-
-.shap-header {
-    display: flex;
-    justify-content: space-between;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.74rem;
-    margin-bottom: 4px;
-}
-
-.shap-bar-track {
-    width: 100%;
-    height: 7px;
-    background: rgba(255, 255, 255, 0.06);
-    border-radius: 4px;
-    overflow: hidden;
-}
-
-.shap-bar-fill {
-    height: 100%;
-    border-radius: 4px;
-}
-
-/* Retro Terminal Reasoning Box */
-.terminal-box {
-    background: #06070B;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 10px;
-    padding: 14px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.78rem;
-    line-height: 1.55;
-    color: #D1D5DB;
-}
-
-.terminal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-    padding-bottom: 8px;
-    margin-bottom: 10px;
-    font-size: 0.68rem;
-    color: var(--text-muted);
-}
-
-.terminal-dots {
-    display: inline-flex;
-    gap: 5px;
-}
-
-.terminal-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    display: inline-block;
-}
-
-/* Pitch Tab KPI Cards */
-.kpi-card {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
-    border-radius: 12px;
-    padding: 18px 20px;
-}
-
-.kpi-bracket-value {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1.52rem;
-    font-weight: 700;
-    letter-spacing: -0.03em;
-    margin-bottom: 6px;
-}
-
-.kpi-title {
-    font-family: 'Inter', sans-serif;
-    font-size: 0.82rem;
-    font-weight: 600;
-    color: var(--text-primary);
-}
-
-.kpi-subtitle {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.7rem;
-    color: var(--text-muted);
-    margin-top: 3px;
-}
-
-/* Custom Styling for Streamlit Tabs */
-.stTabs [data-baseweb="tab-list"] {
-    gap: 8px;
-    background-color: var(--bg-surface);
-    padding: 6px;
-    border-radius: 10px;
-    border: 1px solid var(--border-subtle);
-}
-
-.stTabs [data-baseweb="tab"] {
-    height: 36px;
-    border-radius: 7px;
-    padding: 0 16px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.78rem;
-    font-weight: 500;
-    color: var(--text-muted);
-}
-
-.stTabs [aria-selected="true"] {
-    background-color: var(--bg-surface-elevated) !important;
-    color: var(--accent-green) !important;
-    border: 1px solid rgba(0, 255, 157, 0.25) !important;
-}
-
-/* Flash Deal Alert Special Card */
-.flash-deal-alert {
-    background: linear-gradient(135deg, rgba(0, 255, 157, 0.16) 0%, rgba(245, 158, 11, 0.12) 50%, rgba(17, 19, 26, 0.98) 100%);
-    border: 2px solid #00FF9D;
-    box-shadow: 0 0 32px rgba(0, 255, 157, 0.28), 0 0 12px rgba(245, 158, 11, 0.2);
-    border-radius: 14px;
-    padding: 20px 24px;
-    margin-bottom: 20px;
-    animation: flashGlow 2.5s infinite alternate ease-in-out;
-}
-
-@keyframes flashGlow {
-    0% {
-        box-shadow: 0 0 16px rgba(0, 255, 157, 0.2);
-        border-color: rgba(0, 255, 157, 0.6);
-    }
-    100% {
-        box-shadow: 0 0 35px rgba(0, 255, 157, 0.45), 0 0 16px rgba(245, 158, 11, 0.35);
-        border-color: #00FF9D;
-    }
-}
-
-.flash-deal-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    background: rgba(0, 255, 157, 0.2);
-    border: 1px solid #00FF9D;
-    color: #00FF9D;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.78rem;
-    font-weight: 700;
-    padding: 5px 12px;
-    border-radius: 999px;
-    letter-spacing: 0.05em;
-    margin-bottom: 8px;
-}
-
-.flash-deal-headline {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1.42rem;
-    font-weight: 700;
-    color: #FFFFFF;
-    letter-spacing: -0.02em;
-    line-height: 1.25;
-    margin-bottom: 8px;
-}
-
-.flash-deal-desc {
-    font-family: 'Inter', sans-serif;
-    font-size: 0.88rem;
-    color: #D1D5DB;
-    line-height: 1.55;
+.vc-badge-paused {
+    display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: 0.72rem;
+    font-weight: 700; letter-spacing: 0.08em; margin-right: 10px;
+    background: rgba(142,149,165,0.14); color: #8E95A5; border: 1px solid rgba(142,149,165,0.35);
 }
 </style>
-"""
-
-st.markdown(SWISS_DARK_CSS, unsafe_allow_html=True)
-
-# =====================================================================
-# DATA & ML PIPELINE INTEGRATION (model.joblib)
-# =====================================================================
-@st.cache_data
-def load_telemetry_dataset() -> pd.DataFrame:
-    """Citește micro-datele celor 100 de prosumatori și macro-datele meteo/PZU, calculând surplusul național și lag-urile."""
-    macro_path = Path("data/1_macro_vreme_piata.csv")
-    prosumers_path = Path("data/2_micro_100_prosumatori.csv")
-
-    prosumers_df = pd.read_csv(prosumers_path)
-    prosumers_df["timestamp"] = pd.to_datetime(prosumers_df["timestamp"])
-    
-    surplus_df = (
-        prosumers_df.groupby("timestamp", as_index=False)["export_in_retea_kw"]
-        .sum()
-        .rename(columns={"export_in_retea_kw": "Surplus_National_kW"})
-    )
-    surplus_df["Surplus_National_MW"] = surplus_df["Surplus_National_kW"] / 1000.0
-
-    macro_df = pd.read_csv(macro_path)
-    macro_df["timestamp"] = pd.to_datetime(macro_df["timestamp"])
-
-    df = pd.merge(surplus_df, macro_df, on="timestamp", how="inner")
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    df["hour"] = df["timestamp"].dt.hour
-    df["dayofweek"] = df["timestamp"].dt.dayofweek
-    df["hour_sin"] = np.sin(2.0 * np.pi * df["hour"] / 24.0)
-    df["hour_cos"] = np.cos(2.0 * np.pi * df["hour"] / 24.0)
-
-    df["surplus_lag_1"] = df["Surplus_National_MW"].shift(1)
-    df["surplus_lag_2"] = df["Surplus_National_MW"].shift(2)
-    df["surplus_lag_24"] = df["Surplus_National_MW"].shift(24)
-    df["temp_lag_1"] = df["temp_c"].shift(1)
-    df["radiatie_lag_1"] = df["radiatie_solara_wm2"].shift(1)
-    df["pret_lag_1"] = df["pret_pzu_eur_mwh"].shift(1)
-
-    return df
-
-
-@st.cache_resource
-def load_surplus_model():
-    """Încarcă model.joblib antrenat pentru predicția surplusului la t+2 ore."""
-    candidate_paths = [Path("model.joblib"), Path("models/model.joblib")]
-    for p in candidate_paths:
-        if p.exists():
-            try:
-                bundle = joblib.load(p)
-                if isinstance(bundle, dict) and "model" in bundle:
-                    return bundle["model"], bundle.get("feature_names", []), bundle.get("metrics", {})
-                return bundle, [], {}
-            except Exception:
-                continue
-    return None, [], {}
-
-
-telemetry_data = load_telemetry_dataset()
-ml_model, ml_feature_names, ml_metrics = load_surplus_model()
+""",
+    unsafe_allow_html=True,
+)
 
 # =====================================================================
-# INITIALIZE STATE & SERVICES
+# DATA, MODEL & AGENT
 # =====================================================================
+
+
+@st.cache_data(show_spinner=False)
+def load_feed() -> Tuple[pd.DataFrame, str]:
+    """Încarcă CSV-ul cronologic; dacă lipsește, generează 48h realiste la runtime."""
+    if Path(DATA_PATH).exists():
+        df = pd.read_csv(DATA_PATH)
+        source = str(DATA_PATH)
+    else:
+        df = generate_synthetic_dataset(n_hours=48)
+        source = "synthetic runtime feed (48h)"
+    df = df.reset_index(drop=True)
+    df["dt"] = pd.to_datetime(df["timestamp"])
+    if "gross_solar_mw" not in df.columns:
+        derating = 1.0 - np.maximum(0.0, (df["ambient_temp_celsius"] - 25.0) * 0.004)
+        df["gross_solar_mw"] = df["solar_irradiance_wm2"] / 1000.0 * 17.8 * derating
+    return df, source
+
+
+def ensure_model(agent: VoltComputeAgent, feed: pd.DataFrame) -> str:
+    """Folosește models/model_surplus.pkl; dacă lipsește, antrenează un HistGradientBoosting."""
+    if agent.model_artifact is not None and "model" in agent.model_artifact:
+        return "model_surplus.pkl"
+    if TARGET_COLUMN in feed.columns:
+        engineered = add_engineered_features(feed)
+        model = HistGradientBoostingRegressor(max_iter=200, max_depth=5, learning_rate=0.05, random_state=42)
+        model.fit(engineered[ENGINEERED_FEATURE_COLUMNS], engineered[TARGET_COLUMN])
+        agent.model_artifact = {"model": model, "feature_columns": ENGINEERED_FEATURE_COLUMNS}
+        return "HistGradientBoosting (runtime fallback)"
+    return "physics fallback"
+
+
+feed, feed_source = load_feed()
+N_ROWS = len(feed)
+MAX_STEP = max(0, N_ROWS - 1 - LOOKAHEAD_HOURS)
+# Scală verticală fixă pentru grafic, ca axa să nu "sară" la fiecare tick (ca pe un terminal de bursă)
+Y_AXIS_MAX = float(feed["gross_solar_mw"].max()) * 1.08 + 0.5
+
 if "agent" not in st.session_state:
     st.session_state.agent = VoltComputeAgent()
-if "simulator" not in st.session_state:
-    st.session_state.simulator = VoltComputeSimulator(agent=st.session_state.agent)
-if "dispatch_history" not in st.session_state:
-    st.session_state.dispatch_history = []
-if "last_decision" not in st.session_state:
-    st.session_state.last_decision = None
-if "last_center" not in st.session_state:
-    st.session_state.last_center = None
+    st.session_state.model_source = ensure_model(st.session_state.agent, feed)
+if "pred_cache" not in st.session_state:
+    st.session_state.pred_cache = {}
+if "autoplay" not in st.session_state:
+    st.session_state.autoplay = False
+if "pending_advance" not in st.session_state:
+    st.session_state.pending_advance = False
+if "accepted" not in st.session_state:
+    st.session_state.accepted = {}
+if "current_step" not in st.session_state:
+    candidates = feed[(feed["hour"] == 13) & (feed.get("surplus_mw", 0) > 4.0)] if "surplus_mw" in feed.columns else feed.iloc[0:0]
+    if len(candidates) > 0:
+        default_step = int(candidates.index[0])
+    else:
+        noon = feed[feed["hour"].isin([12, 13])]
+        default_step = int(noon.index[0]) if len(noon) > 0 else 0
+    st.session_state.current_step = int(min(default_step, MAX_STEP))
+
+# Avansarea automată trebuie aplicată înainte ca widgetul slider să fie creat
+if st.session_state.pending_advance:
+    st.session_state.pending_advance = False
+    st.session_state.current_step = int(min(MAX_STEP, st.session_state.current_step + 1))
 
 agent: VoltComputeAgent = st.session_state.agent
-simulator: VoltComputeSimulator = st.session_state.simulator
 
-# Load ML MAE metric for header badge
-mae_display = "0.007 MW"
-if ml_metrics and "test_mae" in ml_metrics:
-    mae_display = f"{ml_metrics['test_mae']:.4f} MW"
-else:
-    metrics_path = Path("models/metrics.json")
-    if metrics_path.exists():
-        try:
-            with open(metrics_path, "r", encoding="utf-8") as f:
-                metrics_data = json.load(f)
-            mae_val = metrics_data.get("xgboost_regressor", {}).get("mae", 0.039)
-            mae_display = f"{mae_val:.3f} MW"
-        except Exception:
-            mae_display = "0.007 MW"
 
-now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+def net_injection_mw(row: pd.Series) -> float:
+    local_load = 1.4 + 0.5 * float(np.sin(np.pi * int(row["hour"]) / 12.0))
+    return round(max(0.0, float(row["gross_solar_mw"]) - local_load), 3)
+
+
+def predict_step(idx: int) -> Tuple[float, float, Dict[str, float]]:
+    """Surplus prezis de model (agent.estimate) pentru rândul `idx` din CSV."""
+    cache = st.session_state.pred_cache
+    if idx not in cache:
+        row = feed.iloc[idx]
+        grid = GridTelemetry(
+            timestamp=str(row["timestamp"]),
+            hour=int(row["hour"]),
+            solar_irradiance_wm2=float(row["solar_irradiance_wm2"]),
+            ambient_temp_celsius=float(row["ambient_temp_celsius"]),
+            day_ahead_price_eur=float(row["day_ahead_price_eur"]),
+            grid_capacity_limit_mw=float(row.get("grid_capacity_limit_mw", 10.0)),
+            is_weekend=int(row["dt"].day_of_week >= 5),
+        )
+        cache[idx] = agent.estimate(grid)
+    return cache[idx]
+
+
+def allocate(surplus: float, confidence: float) -> List[Dict[str, Any]]:
+    """
+    Împarte surplusul între nodurile valide, proporțional cu coada de joburi
+    (nodul cu coada cea mai mare primește cel mai mult), respectând capacitatea fiecărui nod.
+    Nodurile peste limita termică sunt respinse automat.
+    """
+    results = []
+    for node in DATACENTERS:
+        results.append({**node, "allocated_mw": 0.0, "status": "STANDBY", "jobs": 0})
+
+    valid = [r for r in results if r["cooling_c"] <= agent.THERMAL_LIMIT_CELSIUS]
+    for r in results:
+        if r["cooling_c"] > agent.THERMAL_LIMIT_CELSIUS:
+            r["status"] = "REJECTED_THERMAL_SAFETY"
+
+    if surplus > agent.MIN_SURPLUS_THRESHOLD_MW and confidence < agent.CONFIDENCE_THRESHOLD:
+        for r in valid:
+            r["status"] = "ESCALATE_TO_HUMAN"
+        return results
+
+    if surplus > agent.MIN_SURPLUS_THRESHOLD_MW:
+        remaining = min(surplus, sum(r["capacity_mw"] for r in valid))
+        active = list(valid)
+        for _ in range(8):
+            active = [r for r in active if r["allocated_mw"] < r["capacity_mw"] - 1e-9]
+            if remaining < 0.005 or not active:
+                break
+            weight_sum = sum(r["queue"] for r in active)
+            given = 0.0
+            for r in active:
+                share = remaining * r["queue"] / weight_sum
+                grant = min(share, r["capacity_mw"] - r["allocated_mw"])
+                r["allocated_mw"] += grant
+                given += grant
+            remaining -= given
+        for r in valid:
+            r["allocated_mw"] = round(r["allocated_mw"], 2)
+            if r["allocated_mw"] > 0:
+                r["status"] = "OFFER_GENERATED"
+                r["jobs"] = max(1, int(round(r["queue"] * r["allocated_mw"] / r["capacity_mw"])))
+    return results
+
 
 # =====================================================================
-# 2. HEADER & STATUS BAR WITH LIVE PULSE
+# HEADER + TIMELINE CONTROL BAR
 # =====================================================================
 st.markdown(
     f"""
-<div class="vc-topbar">
-    <div class="vc-topbar-left">
-        <div class="vc-brand">
-            <span class="vc-brand-slash">⚡</span> VOLTCOMPUTE
-        </div>
-        <div class="vc-status-pill">
-            <span class="vc-pulse-dot"></span>
-            ● PPC DISPATCH SYSTEM — ONLINE
-        </div>
-    </div>
-    <div class="vc-topbar-right">
-        <div class="vc-meta-badge">
-            MODEL: <strong>XGBoost v1.2 (MAE: {mae_display})</strong>
-        </div>
-        <div class="vc-meta-badge">
-            SYNC: <strong>{now_str}</strong>
-        </div>
-    </div>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+  <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH</div>
+  <div class="vc-sub">FEED: {feed_source} · MODEL: {st.session_state.model_source} · {N_ROWS}h</div>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
 
-def _execute_dispatch_action(
-    decision_obj: AgentDecision,
-    center_obj: ResearchCenterTelemetry,
-    action_type: str,
-) -> Dict[str, Any]:
-    """Executes APPROVED or REJECTED dispatch via agent.act() and logs it."""
-    action_msg = DispatchAction(
-        decision_id=decision_obj.decision_id,
-        center_id=center_obj.center_id,
-        action=action_type,  # type: ignore[arg-type]
-    )
-    if action_type == "APPROVED" and decision_obj.status == "ESCALATE_TO_HUMAN":
-        decision_obj.allocated_mw = round(
-            min(decision_obj.surplus_predicted_mw, center_obj.max_absorb_capacity_mw),
-            3,
-        )
-    act_result = agent.act(decision_obj, center_obj, action_msg)
-    st.session_state.dispatch_history.insert(
-        0,
-        {
-            "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "decision_id": action_msg.decision_id,
-            "center_id": action_msg.center_id,
-            "action": action_msg.action,
-            "effective_mw": act_result["effective_mw"],
-            "execution_state": act_result["execution_state"],
-            "tariff_eur": act_result["tariff_eur_mwh"],
-        },
-    )
-    return act_result
+def _step_back() -> None:
+    st.session_state.autoplay = False
+    st.session_state.current_step = max(0, int(st.session_state.current_step) - 1)
 
 
-# =====================================================================
-# NAVIGATION TABS
-# =====================================================================
-tab_bento, tab_hitl, tab_pitch = st.tabs(
-    [
-        "01 // LIVE BENTO TELEMETRY & DISPATCH",
-        "02 // HUMAN-IN-THE-LOOP CONSOLE",
-        "03 // LIVE 24H PITCH DEMO",
-    ]
+def _step_forward() -> None:
+    st.session_state.autoplay = False
+    st.session_state.current_step = min(MAX_STEP, int(st.session_state.current_step) + 1)
+
+
+def _toggle_play() -> None:
+    st.session_state.autoplay = not st.session_state.autoplay
+
+
+bar_back, bar_fwd, bar_play, bar_slider = st.columns([1, 1, 1.7, 5], gap="small")
+bar_back.button("◀ Pas Înapoi", on_click=_step_back, width="stretch")
+bar_fwd.button("▶ Pas Înainte", on_click=_step_forward, width="stretch")
+bar_play.button(
+    "⏹ Stop Live Feed" if st.session_state.autoplay else "▶▶ Play Live Feed (Auto-step 1s)",
+    on_click=_toggle_play,
+    type="primary",
+    width="stretch",
 )
-
-# =====================================================================
-# TAB 1: BENTO GRID (25% TELEMETRY | 50% HERO DECISION | 25% XAI & AUDIT)
-# =====================================================================
-with tab_bento:
-    # Controale Telemetrie Rețea bazate pe Datele Reale (macro vreme & piață + micro prosumatori)
-    with st.expander("🎛️ REȚEA PPC LIVE & CONTROALE TELEMETRIE (DATE CITITE DIRECT DIN SENZORI)", expanded=True):
-        s_col1, s_col2, s_col3, s_col4 = st.columns(4)
-        with s_col1:
-            time_idx = st.slider(
-                "Pas Temporal Istoric (Index Oră)",
-                min_value=24,
-                max_value=len(telemetry_data) - 1,
-                value=301,  # 2026-05-13 13:00 (vârf solar de prânz, preț negativ/redus)
-                help="Selectează momentul t din telemetria PPC pentru inferență ML în timp real.",
-            )
-            current_row = telemetry_data.iloc[time_idx]
-            current_ts = current_row["timestamp"]
-            hour = int(current_row["hour"])
-            solar_irradiance = float(current_row["radiatie_solara_wm2"])
-            st.caption(f"🕒 Timestamp: **{current_ts.strftime('%Y-%m-%d %H:%M')}** (Ora {hour:02d}:00)")
-
-        with s_col2:
-            # Curățare elemente hardcodate: Temperatura, radiația și prețul PZU sunt citite direct din date (fără slider manual de temperatură)
-            ambient_temp = float(current_row["temp_c"])
-            da_price = float(current_row["pret_pzu_eur_mwh"])
-            wind_speed = float(current_row["viteza_vant_kmh"])
-            actual_surplus_mw = float(current_row["Surplus_National_MW"])
-            
-            st.markdown(
-                f"""
-                <div style="font-family:'JetBrains Mono',monospace;font-size:0.75rem;color:#8E95A5;line-height:1.65;padding-top:4px;">
-                    <div>🌡️ Temp Ambientală: <strong style="color:#00FF9D;">{ambient_temp:.1f}°C</strong> (Date Senzor)</div>
-                    <div>☀️ Iradianță Solară: <strong style="color:#F3F4F6;">{solar_irradiance:.0f} W/m²</strong></div>
-                    <div>💶 Preț PZU Piață: <strong style="color:#38BDF8;">{da_price:.2f} €/MWh</strong></div>
-                    <div>⚡ Surplus Prosumatori t: <strong style="color:#00FF9D;">{actual_surplus_mw:.3f} MW</strong></div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        with s_col3:
-            grid_limit = st.slider(
-                "PPC Line Limit (MW)",
-                min_value=5.0,
-                max_value=20.0,
-                value=10.0,
-                step=0.5,
-            )
-            confidence_slider = st.slider(
-                "Model Confidence (0.30 - 1.00)",
-                min_value=0.30,
-                max_value=1.00,
-                value=0.95,
-                step=0.01,
-            )
-
-        with s_col4:
-            center_id = st.selectbox(
-                "Target Academic Node / Data Center",
-                [
-                    "DC_AI_BUCURESTI",
-                    "DC_CLOUD_CLUJ",
-                    "DC_EDGE_TIMISOARA",
-                    "ROEDUNET-UPB-AI-CLUSTER",
-                    "UVT-TIMISOARA-HPC",
-                    "TUCN-CLUJ-CLOUD",
-                    "IFIN-HH-MAGURELE",
-                ],
-            )
-            cooling_temp = st.slider(
-                "Rack Cooling (°C) [Max 25°C]",
-                min_value=12.0,
-                max_value=35.0,
-                value=19.5,
-                step=0.5,
-            )
-            max_absorb = st.slider(
-                "Max Node Absorb (MW)",
-                min_value=0.5,
-                max_value=10.0,
-                value=6.0,
-                step=0.5,
-            )
-            pending_jobs = st.slider(
-                "Pending HPC Jobs",
-                min_value=0,
-                max_value=50,
-                value=28,
-                step=1,
-            )
-
-    # Predicție ML pentru surplusul la t+2 ore utilizând model.joblib
-    if ml_model is not None and ml_feature_names:
-        feat_row = telemetry_data.iloc[[time_idx]][ml_feature_names]
-        raw_pred_t2 = float(ml_model.predict(feat_row)[0])
-        predicted_surplus_mw = round(max(0.0, raw_pred_t2), 3)
-    else:
-        predicted_surplus_mw = round(max(0.0, actual_surplus_mw), 3)
-
-    # =====================================================================
-    # PASUL 3: LOGICA AGENTULUI (FLASH DEAL ALERT)
-    # =====================================================================
-    # Dacă modelul prezice un Surplus_National_MW > 0 și prețul PZU din date este mic (< 20 EUR),
-    # afișează componenta vizuală proeminentă de tip "Flash Deal Alert".
-    # TODO: Integrare ML pentru estimare consum Data Centers și răspuns din interfața externă.
-    if predicted_surplus_mw > 0.0 and da_price < 20.0:
-        st.markdown(
-            f"""
-            <div class="flash-deal-alert">
-                <div class="flash-deal-badge">
-                    <span class="vc-pulse-dot"></span>
-                    ⚡ FLASH DEAL ALERT // GREEN COMPUTE ORCHESTRATOR
-                </div>
-                <div class="flash-deal-headline">
-                    Surplus anticipat: {predicted_surplus_mw:.2f} MW. Generare ofertă către Data Centers.
-                </div>
-                <div class="flash-deal-desc">
-                    Oportunitate de descărcare la preț redus: Prețul energiei pe piața PZU este de doar 
-                    <strong>{da_price:.2f} €/MWh</strong> (&lt; 20.00 €/MWh), în timp ce modelul XGBoost estimează 
-                    un surplus critic de <strong>{predicted_surplus_mw:.2f} MW</strong> injectat de prosumatori la t+2 ore.<br>
-                    Oferta automată a fost direcționată către nodul <strong>{center_id}</strong> pentru a preveni congestia în rețeaua PPC.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    # Execute Agent Cycle: perceive() -> estimate() -> decide()
-    raw_grid_input = {
-        "timestamp": current_ts.isoformat(),
-        "hour": hour,
-        "solar_irradiance_wm2": solar_irradiance,
-        "ambient_temp_celsius": ambient_temp,
-        "day_ahead_price_eur": da_price,
-        "grid_capacity_limit_mw": grid_limit,
-        "weather_stability_index": confidence_slider,
-    }
-    raw_center_input = {
-        "center_id": center_id,
-        "cooling_temp_celsius": cooling_temp,
-        "max_absorb_capacity_mw": max_absorb,
-        "pending_compute_jobs": pending_jobs,
-    }
-
-    grid_valid, center_valid, perceive_err = agent.perceive(
-        raw_grid_input, raw_center_input
-    )
-    if perceive_err is not None or grid_valid is None or center_valid is None:
-        decision = perceive_err  # type: ignore[assignment]
-        center_obj = ResearchCenterTelemetry(
-            center_id=center_id,
-            cooling_temp_celsius=cooling_temp,
-            max_absorb_capacity_mw=max_absorb,
-            pending_compute_jobs=pending_jobs,
-        )
-    else:
-        _, conf_score, top_shap = agent.estimate(
-            grid_valid, confidence_override=confidence_slider
-        )
-        # Folosim predicția ML XGBoost din model.joblib pentru decizia de dispecerizare
-        decision = agent.decide(
-            grid_valid, center_valid, predicted_surplus_mw, conf_score, top_shap
-        )
-        center_obj = center_valid
-
-    st.session_state.last_decision = decision
-    st.session_state.last_center = center_obj
-
-    # Compute Net Grid Load for telemetry display
-    temp_derating = 1.0 - max(0.0, (ambient_temp - 25.0) * 0.004)
-    gross_solar_mw = (solar_irradiance / 1000.0) * 17.8 * temp_derating
-    local_load_mw = 1.4 + 0.5 * float(np.sin(np.pi * hour / 12.0))
-    net_grid_load_mw = round(max(0.0, gross_solar_mw - local_load_mw), 2)
-
-    # =================================================================
-    # 3. BENTO GRID 3-COLUMN LAYOUT (25% | 50% | 25%)
-    # =================================================================
-    col_left, col_center, col_right = st.columns([1, 2, 1], gap="medium")
-
-    # -----------------------------------------------------------------
-    # LEFT PANEL (25%): TELEMETRY MICRO-CARDS
-    # -----------------------------------------------------------------
-    with col_left:
-        grid_over_limit = net_grid_load_mw > grid_limit
-        grid_load_color = "#FF4B4B" if grid_over_limit else "#00FF9D"
-        cooling_over_limit = cooling_temp > agent.THERMAL_LIMIT_CELSIUS
-        cooling_color = "#FF4B4B" if cooling_over_limit else "#38BDF8"
-        pzu_color = "#00FF9D" if da_price <= 30.0 else "#F3F4F6"
-
-        st.markdown(
-            f"""
-<div class="bento-card">
-    <div class="bento-section-title">
-        <span>01 // GRID & NODE TELEMETRY</span>
-        <span style="font-family:'JetBrains Mono',monospace;color:#38BDF8;">LIVE</span>
-    </div>
-    <div class="telemetry-grid">
-        <div class="micro-card">
-            <div class="micro-label">Solar Irradiance</div>
-            <div class="micro-value">{solar_irradiance:.0f} <span style="font-size:0.78rem;color:#8E95A5;">W/m²</span></div>
-            <div class="micro-sub" style="color:#00FF9D;">Ambient: {ambient_temp:.1f}°C</div>
-        </div>
-        <div class="micro-card">
-            <div class="micro-label">Grid Load</div>
-            <div class="micro-value" style="color:{grid_load_color};">{net_grid_load_mw:.2f} <span style="font-size:0.78rem;color:#8E95A5;">MW</span></div>
-            <div class="micro-sub" style="color:{grid_load_color};">Limit: {grid_limit:.1f} MW</div>
-        </div>
-        <div class="micro-card">
-            <div class="micro-label">Rack Cooling</div>
-            <div class="micro-value" style="color:{cooling_color};">{cooling_temp:.1f} <span style="font-size:0.78rem;color:#8E95A5;">°C</span></div>
-            <div class="micro-sub" style="color:{cooling_color};">Max Safe: 25.0°C</div>
-        </div>
-        <div class="micro-card">
-            <div class="micro-label">PZU Spot Price</div>
-            <div class="micro-value" style="color:{pzu_color};">{da_price:.1f} <span style="font-size:0.78rem;color:#8E95A5;">€/MWh</span></div>
-            <div class="micro-sub" style="color:#8E95A5;">Green Fixed: 30.0 €</div>
-        </div>
-    </div>
-    <div class="micro-card" style="border-color:rgba(56, 189, 248, 0.25);background:rgba(56, 189, 248, 0.05);">
-        <div class="micro-label" style="color:#38BDF8;">ACADEMIC COMPUTE TARGET</div>
-        <div style="font-family:'JetBrains Mono',monospace;font-size:0.9rem;font-weight:700;color:#F3F4F6;margin-bottom:4px;">
-            {center_id}
-        </div>
-        <div style="display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:#8E95A5;">
-            <span>SLURM QUEUE: <strong style="color:#38BDF8;">{pending_jobs} JOBS</strong></span>
-            <span>CAP: <strong style="color:#F3F4F6;">{max_absorb:.1f} MW</strong></span>
-        </div>
-    </div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    # -----------------------------------------------------------------
-    # CENTER PANEL (50%): HERO DECISION BANNER & EXECUTION METRICS
-    # -----------------------------------------------------------------
-    with col_center:
-        if decision.status == "OFFER_GENERATED":
-            banner_class = "hero-offer"
-            accent_hex = "#00FF9D"
-            tag_label = "● AUTONOMOUS ARBITRAGE ACTIVE // VIRTUAL BATTERY ENGAGED"
-            headline_text = (
-                f"OFFER DISPATCHED: {decision.allocated_mw:.2f} MW @ {decision.fixed_price_eur:.2f} €/MWh"
-            )
-        elif decision.status == "ESCALATE_TO_HUMAN":
-            banner_class = "hero-escalate"
-            accent_hex = "#F59E0B"
-            tag_label = "▲ HUMAN-IN-THE-LOOP REQUIRED // LOW CONFIDENCE THRESHOLD (<0.75)"
-            headline_text = (
-                f"ESCALATE TO DISPATCHER: {decision.surplus_predicted_mw:.2f} MW PENDING"
-            )
-        elif cooling_temp > agent.THERMAL_LIMIT_CELSIUS:
-            banner_class = "hero-thermal"
-            accent_hex = "#FF4B4B"
-            tag_label = "■ THERMAL INTERLOCK ENGAGED // RACK TEMP > 25.0°C"
-            headline_text = (
-                f"ALLOCATION BLOCKED: 0.00 MW ({cooling_temp:.1f}°C OVERHEAT RISK)"
-            )
-        elif decision.status == "DATA_ERROR":
-            banner_class = "hero-thermal"
-            accent_hex = "#FF4B4B"
-            tag_label = "■ TELEMETRY CORRUPTION DETECTED // PYDANTIC V2 GUARD"
-            headline_text = "DATA_ERROR: ZERO MW DISPATCHED"
-        else:
-            banner_class = "hero-normal"
-            accent_hex = "#38BDF8"
-            tag_label = "● NORMAL GRID OPERATION // NO CONGESTION HAZARD"
-            headline_text = (
-                f"GRID BALANCED: SURPLUS {decision.surplus_predicted_mw:.2f} MW (< 2.0 MW THRESHOLD)"
-            )
-
-        st.markdown(
-            f"""
-<div class="hero-banner {banner_class}">
-    <div class="hero-tag" style="color:{accent_hex};">
-        {tag_label}
-    </div>
-    <div class="hero-headline" style="color:{accent_hex};">
-        {headline_text}
-    </div>
-    <div style="font-size:0.86rem;color:#D1D5DB;line-height:1.45;">
-        Target Node: <strong style="font-family:'JetBrains Mono',monospace;color:#38BDF8;">{center_id}</strong>
-        &nbsp;|&nbsp; Decision ID: <span style="font-family:'JetBrains Mono',monospace;color:#8E95A5;">{decision.decision_id}</span>
-    </div>
-    <div class="hero-meta-row">
-        <span>PREDICTED SURPLUS: <strong style="color:#F3F4F6;">{decision.surplus_predicted_mw:.2f} MW</strong></span>
-        <span>ALLOCATED HPC: <strong style="color:{accent_hex};">{decision.allocated_mw:.2f} MW</strong></span>
-        <span>CONFIDENCE: <strong style="color:{accent_hex};">{decision.confidence_score * 100:.1f}%</strong></span>
-        <span>HOURLY PPC REV: <strong style="color:#00FF9D;">+{decision.allocated_mw * decision.fixed_price_eur:.2f} €</strong></span>
-    </div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-        # Manual confirmation button directly inside Center Panel when ESCALATE_TO_HUMAN is active
-        if decision.status == "ESCALATE_TO_HUMAN":
-            esc_col1, esc_col2 = st.columns(2)
-            with esc_col1:
-                if st.button(
-                    f"⚡ CONFIRM & DISPATCH {min(decision.surplus_predicted_mw, max_absorb):.2f} MW MANUALLY",
-                    key="bento_approve_btn",
-                    use_container_width=True,
-                    type="primary",
-                ):
-                    res = _execute_dispatch_action(decision, center_obj, "APPROVED")
-                    st.success(
-                        f"MANUAL OVERRIDE EXECUTED: {res['effective_mw']:.2f} MW dispatched to {center_id}."
-                    )
-            with esc_col2:
-                if st.button(
-                    "⛔ REJECT & CURTAIL SURPLUS",
-                    key="bento_reject_btn",
-                    use_container_width=True,
-                ):
-                    _execute_dispatch_action(decision, center_obj, "REJECTED")
-                    st.error(f"DISPATCH REJECTED BY OPERATOR ({decision.decision_id}).")
-
-        # Secondary Bento Card: Real-Time Power Balance Breakdown
-        unabsorbed_mw = max(0.0, decision.surplus_predicted_mw - decision.allocated_mw)
-        st.markdown(
-            f"""
-<div class="bento-card">
-    <div class="bento-section-title">
-        <span>02 // REAL-TIME POWER ARBITRAGE BALANCE</span>
-        <span style="font-family:'JetBrains Mono',monospace;color:#8E95A5;">HOUR {hour:02d}:00</span>
-    </div>
-    <div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:12px;">
-        <div class="micro-card">
-            <div class="micro-label">Predicted Surplus</div>
-            <div class="micro-value" style="color:#FF4B4B;">{decision.surplus_predicted_mw:.2f} MW</div>
-            <div class="micro-sub" style="color:#8E95A5;">Over {grid_limit:.1f} MW Line Cap</div>
-        </div>
-        <div class="micro-card">
-            <div class="micro-label">Virtual Battery Absorb</div>
-            <div class="micro-value" style="color:#00FF9D;">{decision.allocated_mw:.2f} MW</div>
-            <div class="micro-sub" style="color:#38BDF8;">{pending_jobs} AI Jobs Triggered</div>
-        </div>
-        <div class="micro-card">
-            <div class="micro-label">Residual Curtailment</div>
-            <div class="micro-value" style="color:#F59E0B;">{unabsorbed_mw:.2f} MW</div>
-            <div class="micro-sub" style="color:#8E95A5;">Unabsorbed Power</div>
-        </div>
-    </div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    # -----------------------------------------------------------------
-    # RIGHT PANEL (25%): EXPLAINABILITY (SHAP BARS) & TERMINAL REASONING
-    # -----------------------------------------------------------------
-    with col_right:
-        shap_html_rows = ""
-        if decision.top_shap_features:
-            max_abs_shap = max(
-                max(abs(v) for v in decision.top_shap_features.values()), 0.1
-            )
-            for feat_name, feat_val in decision.top_shap_features.items():
-                width_pct = min(100, int((abs(feat_val) / max_abs_shap) * 100))
-                bar_color = "#00FF9D" if feat_val >= 0 else "#38BDF8"
-                sign_prefix = "+" if feat_val >= 0 else ""
-                shap_html_rows += f"""
-<div class="shap-row">
-    <div class="shap-header">
-        <span style="color:#D1D5DB;">{feat_name}</span>
-        <span style="color:{bar_color};font-weight:600;">{sign_prefix}{feat_val:.3f} MW</span>
-    </div>
-    <div class="shap-bar-track">
-        <div class="shap-bar-fill" style="width:{width_pct}%;background:{bar_color};"></div>
-    </div>
-</div>
-"""
-        else:
-            shap_html_rows = '<div style="font-family:\'JetBrains Mono\',monospace;font-size:0.75rem;color:#8E95A5;">No SHAP attributions available.</div>'
-
-        st.markdown(
-            f"""
-<div class="bento-card">
-    <div class="bento-section-title">
-        <span>03 // SHAP FEATURE ATTRIBUTION</span>
-        <span style="font-family:'JetBrains Mono',monospace;color:#00FF9D;">XAI</span>
-    </div>
-    {shap_html_rows}
-</div>
-<div class="bento-card">
-    <div class="bento-section-title">
-        <span>04 // AGENT REASONING TRACE</span>
-        <span style="font-family:'JetBrains Mono',monospace;color:#8E95A5;">AUDIT</span>
-    </div>
-    <div class="terminal-box">
-        <div class="terminal-header">
-            <span class="terminal-dots">
-                <span class="terminal-dot" style="background:#FF4B4B;"></span>
-                <span class="terminal-dot" style="background:#F59E0B;"></span>
-                <span class="terminal-dot" style="background:#00FF9D;"></span>
-            </span>
-            <span>voltcompute://decision-trace</span>
-        </div>
-        <div style="color:#00FF9D;margin-bottom:6px;">
-            &gt; status: {decision.status} (conf={decision.confidence_score:.2f})
-        </div>
-        <div>
-            &gt; {decision.reasoning}
-        </div>
-    </div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-        with st.expander("📄 Raw Pydantic Contract (`AgentDecision`)"):
-            st.json(decision.model_dump())
-
-    # =====================================================================
-    # PASUL 2: VIEW SUGESTIV - GRAFIC CURBĂ ISTORICĂ & PREDICȚIE ML t+2 ORE
-    # =====================================================================
-    history_start = max(0, time_idx - 24)
-    history_df = telemetry_data.iloc[history_start : time_idx + 1].copy()
-
-    # Puncte temporale: t (curent), t+1 oră, t+2 ore
-    curr_ts = current_row["timestamp"]
-    ts_t1 = curr_ts + pd.Timedelta(hours=1)
-    ts_t2 = curr_ts + pd.Timedelta(hours=2)
-
-    val_t0 = float(current_row["Surplus_National_MW"])
-    # Predicție intermediară la t+1 și predicția ML exactă la t+2
-    val_t2 = float(predicted_surplus_mw)
-    val_t1 = round((val_t0 + val_t2) / 2.0, 3)
-
-    fig_surplus = go.Figure()
-
-    # 1. Curba istorică a surplusului injectat de prosumatori (ultimele 24 ore)
-    fig_surplus.add_trace(
-        go.Scatter(
-            x=history_df["timestamp"],
-            y=history_df["Surplus_National_MW"],
-            mode="lines+markers",
-            name="Istoric Surplus Prosumatori (MW)",
-            line=dict(color="#00FF9D", width=2.5),
-            marker=dict(size=5, color="#00FF9D"),
-            fill="tozeroy",
-            fillcolor="rgba(0, 255, 157, 0.08)",
-            hovertemplate="<b>Istoric: %{x|%d %b %H:%M}</b><br>Surplus: %{y:.3f} MW<extra></extra>",
-        )
+with bar_slider:
+    st.select_slider(
+        "Timeline",
+        options=list(range(MAX_STEP + 1)),
+        key="current_step",
+        format_func=lambda i: feed.iloc[i]["dt"].strftime("%Y-%m-%d %H:%M"),
+        label_visibility="collapsed",
     )
 
-    # 2. Marker pe momentul curent t
-    fig_surplus.add_trace(
-        go.Scatter(
-            x=[curr_ts],
-            y=[val_t0],
-            mode="markers",
-            name="Prezent (t)",
-            marker=dict(size=12, color="#38BDF8", symbol="diamond", line=dict(width=2, color="#FFFFFF")),
-            hovertemplate="<b>Prezent (t): %{x|%d %b %H:%M}</b><br>Surplus Real: %{y:.3f} MW<extra></extra>",
-        )
+# =====================================================================
+# STATE AT STEP T + LOOKAHEAD T+1..T+4
+# =====================================================================
+T = int(st.session_state.current_step)
+row_T = feed.iloc[T]
+surplus_T, conf_T, shap_T = predict_step(T)
+allocs_T = allocate(surplus_T, conf_T)
+total_alloc_T = round(sum(a["allocated_mw"] for a in allocs_T), 2)
+revenue_T = round(total_alloc_T * FIXED_PRICE_EUR, 2)
+
+future_idx = [i for i in range(T + 1, min(N_ROWS, T + 1 + LOOKAHEAD_HOURS))]
+future_surplus = {i: predict_step(i)[0] for i in future_idx}
+peak_candidates = [(T, surplus_T)] + [(i, s) for i, s in future_surplus.items()]
+peak_idx, peak_mw = max(peak_candidates, key=lambda x: x[1])
+
+if peak_mw > 0.05:
+    alert_html = (
+        f'<div class="vc-alert vc-alert-red">⚠️ ALERTĂ CURTAILMENT: Vârf de surplus de {peak_mw:.1f} MW '
+        f'detectat în următoarele ore (la {feed.iloc[peak_idx]["dt"].strftime("%H:%M")}, peste limita liniei de '
+        f'{float(row_T.get("grid_capacity_limit_mw", 10.0)):.0f} MW)</div>'
+    )
+else:
+    alert_html = (
+        f'<div class="vc-alert vc-alert-green">● GRID NOMINAL: nicio depășire a limitei liniei prognozată '
+        f'în următoarele {LOOKAHEAD_HOURS} ore</div>'
     )
 
-    # 3. Predicția ML pe următoarele 2 ore (linie punctată cu altă culoare)
-    fig_surplus.add_trace(
-        go.Scatter(
-            x=[curr_ts, ts_t1, ts_t2],
-            y=[val_t0, val_t1, val_t2],
-            mode="lines+markers",
-            name="Predicție ML XGBoost (t+1, t+2)",
-            line=dict(color="#F59E0B", width=3, dash="dot"),
-            marker=dict(size=9, color="#F59E0B", symbol="circle", line=dict(width=1.5, color="#FFFFFF")),
-            hovertemplate="<b>Predicție ML: %{x|%d %b %H:%M}</b><br>Surplus Estimat: %{y:.3f} MW<extra></extra>",
-        )
+col_main, col_modal = st.columns([0.72, 0.28], gap="large")
+
+# =====================================================================
+# MAIN COLUMN
+# =====================================================================
+with col_main:
+    st.markdown(alert_html, unsafe_allow_html=True)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Iradiere Curentă", f"{float(row_T['solar_irradiance_wm2']):.0f} W/m²", f"{row_T['dt'].strftime('%H:%M')} · {float(row_T['ambient_temp_celsius']):.1f}°C")
+    m2.metric(
+        "Capacitate Rețea",
+        f"{float(row_T.get('grid_capacity_limit_mw', 10.0)):.0f} MW",
+        f"injecție {net_injection_mw(row_T):.1f} MW",
+        delta_color="inverse",
     )
+    m3.metric("Total Surplus Alocat", f"{total_alloc_T:.2f} MW", f"din {surplus_T:.2f} MW prezis")
+    m4.metric("Venit PPC Ora Curentă", f"{revenue_T:,.2f} €", f"PZU {float(row_T['day_ahead_price_eur']):.1f} €/MWh", delta_color="off")
 
-    # 4. Limita de siguranță a liniei PPC (Capacitate Rețea)
-    fig_surplus.add_trace(
-        go.Scatter(
-            x=[history_df["timestamp"].iloc[0], ts_t2],
-            y=[grid_limit, grid_limit],
-            mode="lines",
-            name=f"Capacitate Rețea PPC ({grid_limit:.1f} MW)",
-            line=dict(color="#FF4B4B", width=1.8, dash="dash"),
-            hovertemplate=f"Limită PPC: {grid_limit:.1f} MW<extra></extra>",
-        )
+    # ---------------- Live ticker chart ----------------
+    start_i = max(0, T - HISTORY_HOURS)
+    end_i = min(N_ROWS - 1, T + LOOKAHEAD_HOURS)
+    window = list(range(start_i, end_i + 1))
+    xs = [feed.iloc[i]["dt"].to_pydatetime() for i in window]
+    limit_line = [float(feed.iloc[i].get("grid_capacity_limit_mw", 10.0)) for i in window]
+
+    inj_hist = [net_injection_mw(feed.iloc[i]) if i <= T else None for i in window]
+    inj_fcst = [net_injection_mw(feed.iloc[i]) if i >= T else None for i in window]
+    sur_pred = [predict_step(i)[0] if i >= T else None for i in window]
+
+    node_bars: Dict[str, List[float]] = {n["id"]: [] for n in DATACENTERS}
+    for i in window:
+        s_i, c_i, _ = predict_step(i)
+        for a in allocate(s_i, c_i):
+            node_bars[a["id"]].append(a["allocated_mw"])
+
+    t_x = row_T["dt"].to_pydatetime()
+    live_value = net_injection_mw(row_T)
+    prev_value = net_injection_mw(feed.iloc[T - 1]) if T > 0 else live_value
+    tick_delta = live_value - prev_value
+    tick_color = "#00FF9D" if tick_delta >= 0 else "#FF4B4B"
+    tick_arrow = "▲" if tick_delta >= 0 else "▼"
+    status_badge = (
+        '<span class="vc-badge-live">● LIVE</span>'
+        if st.session_state.autoplay
+        else '<span class="vc-badge-paused">❚❚ PAUSED</span>'
     )
-
-    fig_surplus.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="JetBrains Mono, monospace", color="#8E95A5", size=11),
-        title=dict(
-            text=f"⚡ CURBA ISTORICĂ A PRODUCȚIEI/SURPLUSULUI ȘI PREDICȚIA ML PE URMĂTOARELE 2 ORE (MODEL.JOBLIB) — PREDICTED t+2: {val_t2:.2f} MW",
-            font=dict(family="JetBrains Mono, monospace", size=13, color="#F3F4F6"),
-            x=0.0,
-        ),
-        xaxis=dict(
-            title="TIMP (UTC)",
-            gridcolor="rgba(255, 255, 255, 0.05)",
-            zerolinecolor="rgba(255, 255, 255, 0.08)",
-        ),
-        yaxis=dict(
-            title="PUTERE SURPLUS (MW)",
-            gridcolor="rgba(255, 255, 255, 0.05)",
-            zerolinecolor="rgba(255, 255, 255, 0.08)",
-        ),
-        hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1,
-            font=dict(size=11, color="#D1D5DB"),
-        ),
-        height=420,
-        margin=dict(l=20, r=20, t=55, b=20),
+    st.markdown(
+        f"""
+<div class="vc-ticker">
+  <div>{status_badge}<span class="vc-ticker-meta">PPC SOLAR INJECTION · NET MW</span></div>
+  <div>
+    <span class="vc-ticker-price" style="color:{tick_color};">{live_value:.2f} MW</span>
+    <span class="vc-ticker-meta" style="color:{tick_color};margin-left:8px;">{tick_arrow} {abs(tick_delta):.2f} vs T-1h · {t_x.strftime('%d %b %H:%M')}</span>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
-
-    st.markdown('<div class="bento-card" style="margin-top:14px;">', unsafe_allow_html=True)
-    st.plotly_chart(fig_surplus, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# =====================================================================
-# TAB 2: HUMAN-IN-THE-LOOP DISPATCHER CONSOLE
-# =====================================================================
-with tab_hitl:
-    active_decision: AgentDecision = st.session_state.last_decision
-    active_center: ResearchCenterTelemetry = st.session_state.last_center
-
-    hitl_col1, hitl_col2 = st.columns([1.2, 1.8], gap="medium")
-
-    with hitl_col1:
-        st.markdown(
-            f"""
-<div class="bento-card">
-    <div class="bento-section-title">
-        <span>DISPATCHER OVERRIDE TERMINAL</span>
-        <span style="font-family:'JetBrains Mono',monospace;color:#F59E0B;">HITL GATE</span>
-    </div>
-    <div style="font-family:'JetBrains Mono',monospace;font-size:0.8rem;color:#8E95A5;margin-bottom:12px;">
-        DECISION ID: <strong style="color:#F3F4F6;">{active_decision.decision_id}</strong><br>
-        TARGET NODE: <strong style="color:#38BDF8;">{active_center.center_id}</strong><br>
-        CURRENT STATUS: <strong style="color:#00FF9D;">{active_decision.status}</strong><br>
-        PREDICTED SURPLUS: <strong style="color:#F3F4F6;">{active_decision.surplus_predicted_mw:.2f} MW</strong>
-    </div>
-    <div class="terminal-box" style="margin-bottom:14px;">
-        &gt; {active_decision.reasoning}
-    </div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button(
-                "✅ [APROBĂ] DISPATCH (APPROVED)",
-                key="hitl_tab_approve",
-                use_container_width=True,
-                type="primary",
-            ):
-                act_res = _execute_dispatch_action(
-                    active_decision, active_center, "APPROVED"
-                )
-                st.success(
-                    f"APPROVED: {act_res['effective_mw']:.2f} MW routed to {active_center.center_id} @ 30.00 €/MWh."
-                )
-        with b2:
-            if st.button(
-                "⛔ [RESPINGE] BLOCK (REJECTED)",
-                key="hitl_tab_reject",
-                use_container_width=True,
-            ):
-                act_res = _execute_dispatch_action(
-                    active_decision, active_center, "REJECTED"
-                )
-                st.error(
-                    f"REJECTED: Allocation aborted for {active_decision.decision_id} (0.0 MW)."
-                )
-
-    with hitl_col2:
-        st.markdown(
-            """
-<div class="bento-card">
-    <div class="bento-section-title">
-        <span>SCADA & SLURM AUDIT TRAIL (`DispatchAction` LOG)</span>
-        <span style="font-family:'JetBrains Mono',monospace;color:#00FF9D;">IMMUTABLE LOG</span>
-    </div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-        if st.session_state.dispatch_history:
-            st.dataframe(
-                pd.DataFrame(st.session_state.dispatch_history),
-                use_container_width=True,
-                height=280,
-            )
-        else:
-            st.info(
-                "No manual dispatcher actions recorded in this session yet. Use [APROBĂ] or [RESPINGE] to log a SCADA dispatch event."
-            )
-
-# =====================================================================
-# TAB 3: LIVE 24H PITCH DEMO (FLUID PLAYBACK & ULTRA-CLEAN PLOTLY)
-# =====================================================================
-with tab_pitch:
-    ctrl_col1, ctrl_col2 = st.columns([1.3, 2.7], gap="medium")
-
-    with ctrl_col1:
-        scenario_choice = st.selectbox(
-            "SELECT 24H SIMULATION SCENARIO",
-            options=list(SCENARIO_DESCRIPTIONS.keys()),
-            format_func=lambda k: {
-                "CRITICAL_SOLAR_SUNDAY": "01 // CRITICAL_SOLAR_SUNDAY (Peak Arbitrage)",
-                "UNCERTAIN_WEATHER_SHOCK": "02 // UNCERTAIN_WEATHER_SHOCK (Conf < 0.75 -> HITL)",
-                "DATACENTER_THERMAL_RISK": "03 // DATACENTER_THERMAL_RISK (28.5°C Thermal Trip)",
-            }.get(k, k),
-        )
-    with ctrl_col2:
-        st.markdown(
-            f"""
-<div class="bento-card" style="padding:12px 16px;margin-bottom:8px;">
-    <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:#38BDF8;margin-bottom:4px;">
-        SCENARIO BRIEF // {scenario_choice}
-    </div>
-    <div style="font-size:0.84rem;color:#D1D5DB;">
-        {SCENARIO_DESCRIPTIONS[scenario_choice]}
-    </div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    timeline = simulator.generate_24h_scenario(scenario_choice)
-    decisions_list = [step["decision"] for step in timeline]
-    impact = simulator.calculate_impact(decisions_list)
-
-    mwh_saved = impact["mwh_saved_from_curtailment"]
-    ppc_rev = impact["ppc_revenue_eur"]
-    res_sav = impact["researcher_savings_eur"]
-    co2_tons = impact["co2_avoided_tons"]
-
-    # 4. FOUR KPI METRIC CARDS WITH MONOSPACE BRACKET FIGURES
-    k_col1, k_col2, k_col3, k_col4 = st.columns(4, gap="medium")
-
-    with k_col1:
-        st.markdown(
-            f"""
-<div class="kpi-card">
-    <div class="kpi-bracket-value" style="color:#00FF9D;">[ {mwh_saved:.1f} MWh ]</div>
-    <div class="kpi-title">Curtailment Salvat</div>
-    <div class="kpi-subtitle">din {impact['total_surplus_mwh']:.1f} MWh surplus total</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    with k_col2:
-        st.markdown(
-            f"""
-<div class="kpi-card">
-    <div class="kpi-bracket-value" style="color:#00FF9D;">[ +{ppc_rev:,.2f} € ]</div>
-    <div class="kpi-title">Venit Generat PPC</div>
-    <div class="kpi-subtitle">{impact['offers_generated_hours']}h arbitraj @ 30.00 €/MWh</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    with k_col3:
-        st.markdown(
-            f"""
-<div class="kpi-card">
-    <div class="kpi-bracket-value" style="color:#38BDF8;">[ -{res_sav:,.2f} € ]</div>
-    <div class="kpi-title">Economii Noduri Cercetare</div>
-    <div class="kpi-subtitle">vs tarif retail (115.00 €/MWh)</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    with k_col4:
-        st.markdown(
-            f"""
-<div class="kpi-card">
-    <div class="kpi-bracket-value" style="color:#00FF9D;">[ {co2_tons:.2f} t ]</div>
-    <div class="kpi-title">CO₂ Evitat</div>
-    <div class="kpi-subtitle">Escaladări HITL: {impact['human_escalations_hours']}h</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    # ULTRA-CLEAN PLOTLY CHART (DARK THEME, TRANSPARENT BG, NEON LINES)
-    hours_labels = [step["hour_label"] for step in timeline]
-    net_solar = [step["net_solar_generation_mw"] for step in timeline]
-    grid_limits = [step["grid_capacity_limit_mw"] for step in timeline]
-    allocated_mw = [step["decision"]["allocated_mw"] for step in timeline]
-    surplus_mw = [step["decision"]["surplus_predicted_mw"] for step in timeline]
-    statuses = [step["decision"]["status"] for step in timeline]
-    absorbed_top_curve = [
-        limit + alloc for limit, alloc in zip(grid_limits, allocated_mw)
-    ]
 
     fig = go.Figure()
-
-    # 1. Solar Curve with subtle green gradient fill to zero
+    for node in DATACENTERS:
+        fig.add_trace(
+            go.Bar(
+                x=xs,
+                y=node_bars[node["id"]],
+                name=f"Absorbit: {node['short']}",
+                marker_color=node["color"],
+                opacity=0.8,
+            )
+        )
     fig.add_trace(
         go.Scatter(
-            x=hours_labels,
-            y=net_solar,
-            mode="lines+markers",
-            name="Net Solar Injection (MW)",
-            line=dict(color="#00FF9D", width=2.5),
-            marker=dict(size=6, color="#00FF9D"),
-            fill="tozeroy",
-            fillcolor="rgba(0, 255, 157, 0.10)",
-            customdata=list(zip(surplus_mw, allocated_mw, statuses)),
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                "Net Solar: %{y:.2f} MW<br>"
-                "Predicted Surplus: %{customdata[0]:.2f} MW<br>"
-                "HPC Absorbed: %{customdata[1]:.2f} MW<br>"
-                "Status: %{customdata[2]}<extra></extra>"
-            ),
+            x=xs, y=inj_hist, mode="lines", name="Producție solară netă (istoric ≤ T)",
+            line=dict(color="#00FF9D", width=2.5, shape="spline", smoothing=0.6),
+            fill="tozeroy", fillcolor="rgba(0,255,157,0.07)",
         )
     )
-
-    # 2. Grid Capacity Line (10 MW) dashed red
     fig.add_trace(
         go.Scatter(
-            x=hours_labels,
-            y=grid_limits,
-            mode="lines",
-            name="PPC Grid Safety Limit (10.0 MW)",
-            line=dict(color="#FF4B4B", width=2, dash="dash"),
+            x=xs, y=inj_fcst, mode="lines", name="Producție prognozată (CSV T..T+4)",
+            line=dict(color="#38BDF8", width=2, dash="dash", shape="spline", smoothing=0.6),
         )
     )
-
-    # 3. Absorbed Virtual Battery Envelope (above 10 MW line)
     fig.add_trace(
         go.Scatter(
-            x=hours_labels,
-            y=absorbed_top_curve,
-            mode="lines",
-            name="Absorbed by RoEduNet HPC (MW)",
-            line=dict(color="#38BDF8", width=2),
-            fill="tonexty",
-            fillcolor="rgba(56, 189, 248, 0.28)",
+            x=xs, y=sur_pred, mode="lines+markers", name="Surplus prezis de model",
+            line=dict(color="#F59E0B", width=2, dash="dot"), marker=dict(size=6),
         )
     )
-
+    fig.add_trace(
+        go.Scatter(
+            x=xs, y=limit_line, mode="lines", name="Limită linie PPC",
+            line=dict(color="#FF4B4B", width=2),
+        )
+    )
+    # Punctul "live" de la capătul curbei, ca ultimul preț pe un terminal de bursă
+    fig.add_trace(
+        go.Scatter(
+            x=[t_x], y=[live_value], mode="markers", name="Tick curent",
+            marker=dict(size=13, color=tick_color, line=dict(color="#FFFFFF", width=2)),
+            showlegend=False, hoverinfo="skip",
+        )
+    )
+    fig.add_hline(
+        y=live_value, line_width=1, line_dash="dot", line_color=tick_color, opacity=0.6,
+        annotation_text=f" {live_value:.2f} MW ", annotation_position="right",
+        annotation_font=dict(color="#0c0d12", size=11),
+        annotation_bgcolor=tick_color,
+    )
+    fig.add_vrect(
+        x0=t_x, x1=t_x + timedelta(hours=LOOKAHEAD_HOURS), fillcolor="rgba(142,149,165,0.12)", line_width=0,
+        annotation_text="PROGNOZĂ ML", annotation_position="top left",
+        annotation_font=dict(color="#F59E0B", size=11),
+    )
+    fig.add_shape(
+        type="line", x0=t_x, x1=t_x, y0=0, y1=1, yref="paper",
+        line=dict(color="#FF4B4B", width=2, dash="dot"),
+    )
+    fig.add_annotation(
+        x=t_x, y=1, yref="paper", text=f"T = {t_x.strftime('%H:%M')}", showarrow=False,
+        yanchor="bottom", font=dict(color="#FF7B7B", size=11),
+    )
     fig.update_layout(
+        barmode="stack",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="JetBrains Mono, monospace", color="#8E95A5", size=11),
-        title=dict(
-            text=f"24H TELEMETRY PLAYBACK // {scenario_choice}",
-            font=dict(family="JetBrains Mono, monospace", size=13, color="#F3F4F6"),
-            x=0.0,
-        ),
+        height=430,
+        margin=dict(l=10, r=60, t=40, b=10),
+        hovermode="x unified",
+        uirevision="voltcompute-live",
         xaxis=dict(
-            title="HOUR OF DAY (UTC)",
-            gridcolor="rgba(255, 255, 255, 0.05)",
-            zerolinecolor="rgba(255, 255, 255, 0.08)",
+            gridcolor="rgba(255,255,255,0.05)",
+            range=[t_x - timedelta(hours=HISTORY_HOURS), t_x + timedelta(hours=LOOKAHEAD_HOURS)],
+            showspikes=True, spikecolor="rgba(255,255,255,0.35)", spikethickness=1, spikedash="dot",
         ),
         yaxis=dict(
-            title="POWER (MW)",
-            gridcolor="rgba(255, 255, 255, 0.05)",
-            zerolinecolor="rgba(255, 255, 255, 0.08)",
+            title="MW", side="right", range=[0, Y_AXIS_MAX],
+            gridcolor="rgba(255,255,255,0.05)", zerolinecolor="rgba(255,255,255,0.1)",
+            showspikes=True, spikecolor="rgba(255,255,255,0.35)", spikethickness=1, spikedash="dot",
         ),
-        hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1,
-            font=dict(size=11, color="#D1D5DB"),
-        ),
-        height=430,
-        margin=dict(l=20, r=20, t=55, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0, font=dict(size=10)),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # ---------------- Arbitrage table ----------------
+    st.markdown('<div class="vc-sub" style="margin:4px 0;">ARBITRAJ MULTI-NOD · ORA T</div>', unsafe_allow_html=True)
+    table = pd.DataFrame(
+        [
+            {
+                "Nod": a["name"],
+                "Temp Răcire (°C)": a["cooling_c"],
+                "Capacitate (MW)": a["capacity_mw"],
+                "Status Agent": a["status"],
+                "Ofertă (MW)": a["allocated_mw"],
+                "Preț Fix (€/MWh)": FIXED_PRICE_EUR if a["allocated_mw"] > 0 else 0.0,
+                "Joburi Deblocate": f"{a['jobs']}/{a['queue']}",
+            }
+            for a in allocs_T
+        ]
     )
 
-    st.markdown('<div class="bento-card" style="margin-top:12px;">', unsafe_allow_html=True)
-    st.plotly_chart(fig, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    def _status_color(value: str) -> str:
+        palette = {
+            "OFFER_GENERATED": "color:#00FF9D;font-weight:600",
+            "REJECTED_THERMAL_SAFETY": "color:#FF4B4B;font-weight:600",
+            "ESCALATE_TO_HUMAN": "color:#F59E0B;font-weight:600",
+        }
+        return palette.get(value, "color:#8E95A5")
 
-    with st.expander("📋 24H HOURLY DISPATCH TELEMETRY MATRIX"):
-        table_rows = []
-        for step in timeline:
-            dec = step["decision"]
-            grid_t = step["grid_telemetry"]
-            center_t = step["center_telemetry"]
-            table_rows.append(
-                {
-                    "Hour": step["hour_label"],
-                    "Irradiance (W/m²)": grid_t["solar_irradiance_wm2"],
-                    "Net Load (MW)": step["net_solar_generation_mw"],
-                    "Surplus (MW)": dec["surplus_predicted_mw"],
-                    "Confidence": dec["confidence_score"],
-                    "Rack Temp (°C)": center_t["cooling_temp_celsius"],
-                    "Status": dec["status"],
-                    "Allocated HPC (MW)": dec["allocated_mw"],
-                    "Reasoning": dec["reasoning"],
-                }
-            )
-        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, height=340)
+    st.dataframe(
+        table.style.map(_status_color, subset=["Status Agent"]).format(
+            {"Temp Răcire (°C)": "{:.1f}", "Capacitate (MW)": "{:.1f}", "Ofertă (MW)": "{:.2f}", "Preț Fix (€/MWh)": "{:.2f}"}
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+
+# =====================================================================
+# SECONDARY COLUMN: DATACENTER CLIENT VIEW (UPB)
+# =====================================================================
+with col_modal:
+    st.markdown('<div class="vc-sub" style="margin-bottom:8px;">DATACENTER CLIENT VIEW</div>', unsafe_allow_html=True)
+    upb = next(a for a in allocs_T if a["id"] == "ROEDUNET-UPB-BUC")
+
+    if upb["allocated_mw"] > 0:
+        window_hours = 1
+        for i in future_idx:
+            if future_surplus[i] > agent.MIN_SURPLUS_THRESHOLD_MW:
+                window_hours += 1
+            else:
+                break
+        savings = upb["allocated_mw"] * window_hours * (REFERENCE_TARIFF_EUR - FIXED_PRICE_EUR)
+        st.markdown(
+            f"""
+<div class="vc-modal">
+  <div class="vc-modal-head">🔔 ROEDUNET SLURM DAEMON</div>
+  <div class="vc-modal-title">INCOMING POWER DISPATCH OFFER</div>
+  <div class="vc-modal-body">
+    PPC Dispatcher oferă <span class="vc-mono" style="color:#00FF9D;">{upb['allocated_mw']:.2f} MW</span> surplus solar
+    pentru următoarele <span class="vc-mono">{window_hours}</span> ore la
+    <span class="vc-mono" style="color:#00FF9D;">{FIXED_PRICE_EUR:.2f} €/MWh</span>
+    (vs <span class="vc-mono">{REFERENCE_TARIFF_EUR:.2f} €/MWh</span> tarif standard).
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        k1, k2 = st.columns(2)
+        k1.metric("Economie estimată", f"-{savings:,.2f} €")
+        k2.metric("Joburi AI pornite", f"{upb['jobs']}/{upb['queue']}")
+
+        already = st.session_state.accepted.get(T)
+        if already == "ACCEPTED":
+            st.success("Ofertă acceptată pentru acest pas.")
+        elif already == "REFUSED":
+            st.info("Ofertă refuzată pentru acest pas.")
+        b_accept, b_refuse = st.columns(2)
+        if b_accept.button("Acceptă & Scalează GPU-uri", key=f"accept_{T}", type="primary", width="stretch"):
+            st.session_state.accepted[T] = "ACCEPTED"
+            st.toast("✅ GPU Nodes scaled to 100% capacity.")
+            st.rerun()
+        if b_refuse.button("Refuză", key=f"refuse_{T}", width="stretch"):
+            st.session_state.accepted[T] = "REFUSED"
+            st.toast("Ofertă refuzată de administratorul UPB.")
+            st.rerun()
+    else:
+        reason = (
+            "Încredere model sub prag - decizie la dispecer."
+            if surplus_T > agent.MIN_SURPLUS_THRESHOLD_MW
+            else f"Surplus {surplus_T:.2f} MW sub pragul de {agent.MIN_SURPLUS_THRESHOLD_MW:.1f} MW."
+        )
+        st.markdown(
+            f"""
+<div class="vc-modal">
+  <div class="vc-modal-head">🔔 ROEDUNET SLURM DAEMON</div>
+  <div class="vc-modal-title">NO ACTIVE OFFER</div>
+  <div class="vc-modal-body">{reason} Cluster-ul rămâne pe alimentare standard.</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+# =====================================================================
+# AUTO-STEP
+# =====================================================================
+if st.session_state.autoplay:
+    time.sleep(AUTOPLAY_SECONDS)
+    if st.session_state.current_step < MAX_STEP:
+        st.session_state.pending_advance = True
+    else:
+        st.session_state.autoplay = False
+    st.rerun()
