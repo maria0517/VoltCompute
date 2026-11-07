@@ -338,16 +338,65 @@ allocs_T = allocate(surplus_T, conf_T)
 total_alloc_T = round(sum(a["allocated_mw"] for a in allocs_T), 2)
 revenue_T = round(total_alloc_T * FIXED_PRICE_EUR, 2)
 
+is_accepted = (st.session_state.accepted.get(T) == "ACCEPTED")
+is_refused = (st.session_state.accepted.get(T) == "REFUSED")
+
+# Calcul profit cumulat pe întreaga sesiune din ofertele aprobate
+def _get_alloc_for_step(step_idx: int) -> float:
+    s_val, c_val, _ = predict_step(step_idx)
+    return round(sum(a["allocated_mw"] for a in allocate(s_val, c_val)), 2)
+
+cumulative_profit = sum(
+    _get_alloc_for_step(idx) * FIXED_PRICE_EUR
+    for idx, status in st.session_state.accepted.items()
+    if status == "ACCEPTED"
+)
+
+# Curentul (injecția netă) și surplusul înainte vs după dispecerizare
+raw_injection_T = net_injection_mw(row_T)
+actual_injection_T = max(0.0, raw_injection_T - total_alloc_T) if is_accepted else raw_injection_T
+grid_limit_mw = float(row_T.get("grid_capacity_limit_mw", 10.0))
+actual_surplus_T = max(0.0, actual_injection_T - grid_limit_mw) if is_accepted else surplus_T
+actual_profit_T = revenue_T if is_accepted else 0.0
+
 future_idx = [i for i in range(T + 1, min(N_ROWS, T + 1 + LOOKAHEAD_HOURS))]
 future_surplus = {i: predict_step(i)[0] for i in future_idx}
+upcoming_spikes = [i for i in future_idx if predict_step(i)[0] > agent.MIN_SURPLUS_THRESHOLD_MW]
+has_upcoming_spike = len(upcoming_spikes) > 0
+first_spike_idx = upcoming_spikes[0] if has_upcoming_spike else None
+is_first_spike_prebooked = (st.session_state.accepted.get(first_spike_idx) == "ACCEPTED") if first_spike_idx is not None else False
+
 peak_candidates = [(T, surplus_T)] + [(i, s) for i, s in future_surplus.items()]
 peak_idx, peak_mw = max(peak_candidates, key=lambda x: x[1])
 
-if peak_mw > 0.05:
+if is_accepted and total_alloc_T > 0:
+    alert_html = (
+        f'<div class="vc-alert vc-alert-green">✅ REȚEA STABILIZATĂ: Surplusul de {total_alloc_T:.2f} MW '
+        f'a fost evacuat la nodurile universitare la {row_T["dt"].strftime("%H:%M")}! '
+        f'Curentul a scăzut de la {raw_injection_T:.2f} MW la {actual_injection_T:.2f} MW · '
+        f'Profit PPC confirmat: +{actual_profit_T:,.2f} €</div>'
+    )
+elif has_upcoming_spike and total_alloc_T == 0:
+    s_lead = predict_step(first_spike_idx)[0]
+    lead_h = first_spike_idx - T
+    t_lead_str = feed.iloc[first_spike_idx]["dt"].strftime("%H:%M")
+    if is_first_spike_prebooked:
+        alert_html = (
+            f'<div class="vc-alert vc-alert-green">✅ PRE-DISPECERIZARE ACTIVĂ (T+{lead_h}): '
+            f'Vârful de {s_lead:.1f} MW de la ora {t_lead_str} (în {lead_h}h) este deja PRE-REZERVAT! '
+            f'Capacitatea academică e alocată, iar prognoza e stabilizată în siguranță sub 10 MW.</div>'
+        )
+    else:
+        alert_html = (
+            f'<div class="vc-alert vc-alert-red">🔔 PREAVIZ CURTAILMENT (T+{lead_h}h): '
+            f'Modelul AI prognozează un spike critic de {s_lead:.1f} MW la ora {t_lead_str} '
+            f'(peste limita liniei de {grid_limit_mw:.0f} MW) · Pre-rezervă capacitatea universitară cu 2 ore înainte!</div>'
+        )
+elif peak_mw > 0.05:
     alert_html = (
         f'<div class="vc-alert vc-alert-red">⚠️ ALERTĂ CURTAILMENT: Vârf de surplus de {peak_mw:.1f} MW '
         f'detectat în următoarele ore (la {feed.iloc[peak_idx]["dt"].strftime("%H:%M")}, peste limita liniei de '
-        f'{float(row_T.get("grid_capacity_limit_mw", 10.0)):.0f} MW)</div>'
+        f'{grid_limit_mw:.0f} MW) · Aprobă dispecerizarea pentru evacuare și profit!</div>'
     )
 else:
     alert_html = (
@@ -364,15 +413,49 @@ with col_main:
     st.markdown(alert_html, unsafe_allow_html=True)
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Iradiere Curentă", f"{float(row_T['solar_irradiance_wm2']):.0f} W/m²", f"{row_T['dt'].strftime('%H:%M')} · {float(row_T['ambient_temp_celsius']):.1f}°C")
-    m2.metric(
-        "Capacitate Rețea",
-        f"{float(row_T.get('grid_capacity_limit_mw', 10.0)):.0f} MW",
-        f"injecție {net_injection_mw(row_T):.1f} MW",
-        delta_color="inverse",
+    m1.metric(
+        "Iradiere Curentă",
+        f"{float(row_T['solar_irradiance_wm2']):.0f} W/m²",
+        f"{row_T['dt'].strftime('%H:%M')} · {float(row_T['ambient_temp_celsius']):.1f}°C",
     )
-    m3.metric("Total Surplus Alocat", f"{total_alloc_T:.2f} MW", f"din {surplus_T:.2f} MW prezis")
-    m4.metric("Venit PPC Ora Curentă", f"{revenue_T:,.2f} €", f"PZU {float(row_T['day_ahead_price_eur']):.1f} €/MWh", delta_color="off")
+    if is_accepted:
+        m2.metric(
+            "Injecție Rețea PPC",
+            f"{actual_injection_T:.2f} MW",
+            f"-{total_alloc_T:.2f} MW evacuați (stabilizată ✅)",
+            delta_color="normal",
+        )
+        m3.metric(
+            "Surplus Rețea Rămas",
+            f"{actual_surplus_T:.2f} MW",
+            f"0.00 MW risc curtailment ✅",
+            delta_color="normal",
+        )
+        m4.metric(
+            "Profit Arbitraj PPC",
+            f"+{actual_profit_T:,.2f} €",
+            f"Total cumulat: +{cumulative_profit:,.2f} €",
+            delta_color="normal",
+        )
+    else:
+        m2.metric(
+            "Injecție Rețea PPC",
+            f"{raw_injection_T:.2f} MW",
+            f"limită linie: {grid_limit_mw:.0f} MW",
+            delta_color="inverse" if raw_injection_T > grid_limit_mw else "off",
+        )
+        m3.metric(
+            "Surplus de Arbitrat",
+            f"{surplus_T:.2f} MW",
+            f"{total_alloc_T:.2f} MW ofertabili" if total_alloc_T > 0 else "nominal",
+            delta_color="inverse" if surplus_T > 2.0 else "off",
+        )
+        m4.metric(
+            "Profit Arbitraj PPC",
+            f"0.00 €",
+            f"+{revenue_T:,.2f} € în așteptare aprobare" if revenue_T > 0 else f"PZU {float(row_T['day_ahead_price_eur']):.1f} €/MWh",
+            delta_color="normal" if revenue_T > 0 else "off",
+        )
 
     # ---------------- Live ticker chart ----------------
     start_i = max(0, T - HISTORY_HOURS)
@@ -381,9 +464,26 @@ with col_main:
     xs = [feed.iloc[i]["dt"].to_pydatetime() for i in window]
     limit_line = [float(feed.iloc[i].get("grid_capacity_limit_mw", 10.0)) for i in window]
 
-    inj_hist = [net_injection_mw(feed.iloc[i]) if i <= T else None for i in window]
-    inj_fcst = [net_injection_mw(feed.iloc[i]) if i >= T else None for i in window]
-    sur_pred = [predict_step(i)[0] if i >= T else None for i in window]
+    def _dispatched_inj_for_step(step_idx: int) -> float:
+        raw = net_injection_mw(feed.iloc[step_idx])
+        if st.session_state.accepted.get(step_idx) == "ACCEPTED":
+            alloc_val = _get_alloc_for_step(step_idx)
+            return max(0.0, raw - alloc_val)
+        return raw
+
+    inj_hist = [_dispatched_inj_for_step(i) if i <= T else None for i in window]
+    inj_raw_hist = [net_injection_mw(feed.iloc[i]) if i <= T else None for i in window]
+    inj_fcst = [_dispatched_inj_for_step(i) if i >= T else None for i in window]
+    inj_raw_fcst = [net_injection_mw(feed.iloc[i]) if i >= T else None for i in window]
+
+    def _dispatched_surplus_for_step(step_idx: int) -> float:
+        if st.session_state.accepted.get(step_idx) == "ACCEPTED":
+            disp = _dispatched_inj_for_step(step_idx)
+            lim = float(feed.iloc[step_idx].get("grid_capacity_limit_mw", 10.0))
+            return max(0.0, disp - lim)
+        return predict_step(step_idx)[0]
+
+    sur_pred = [_dispatched_surplus_for_step(i) if i >= T else None for i in window]
 
     node_bars: Dict[str, List[float]] = {n["id"]: [] for n in DATACENTERS}
     for i in window:
@@ -392,16 +492,18 @@ with col_main:
             node_bars[a["id"]].append(a["allocated_mw"])
 
     t_x = row_T["dt"].to_pydatetime()
-    live_value = net_injection_mw(row_T)
-    prev_value = net_injection_mw(feed.iloc[T - 1]) if T > 0 else live_value
+    live_value = actual_injection_T
+    prev_value = _dispatched_inj_for_step(T - 1) if T > 0 else live_value
     tick_delta = live_value - prev_value
-    tick_color = "#00FF9D" if tick_delta >= 0 else "#FF4B4B"
+    tick_color = "#00FF9D" if is_accepted else ("#00FF9D" if tick_delta >= 0 else "#FF4B4B")
     tick_arrow = "▲" if tick_delta >= 0 else "▼"
-    status_badge = (
-        '<span class="vc-badge-live">● LIVE</span>'
-        if st.session_state.autoplay
-        else '<span class="vc-badge-paused">❚❚ PAUSED</span>'
-    )
+    if is_accepted:
+        status_badge = '<span class="vc-badge-live" style="background:rgba(0,255,157,0.18);color:#00FF9D;border:1px solid rgba(0,255,157,0.5);">● SURPLUS ABSORBIT</span>'
+    elif st.session_state.autoplay:
+        status_badge = '<span class="vc-badge-live">● LIVE</span>'
+    else:
+        status_badge = '<span class="vc-badge-paused">❚❚ PAUSED</span>'
+
     st.markdown(
         f"""
 <div class="vc-ticker">
@@ -428,20 +530,35 @@ with col_main:
         )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=inj_hist, mode="lines", name="Producție solară netă (istoric ≤ T)",
+            x=xs, y=inj_hist, mode="lines", name="Injecție netă PPC (după arbitraj ≤ T)",
             line=dict(color="#00FF9D", width=2.5, shape="spline", smoothing=0.6),
             fill="tozeroy", fillcolor="rgba(0,255,157,0.07)",
         )
     )
+    if is_accepted:
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=inj_raw_hist, mode="lines", name="Producție brută T (fără arbitraj)",
+                line=dict(color="#8E95A5", width=1.5, dash="dot"),
+            )
+        )
+    any_future_prebooked = any(st.session_state.accepted.get(i) == "ACCEPTED" for i in future_idx)
+    if any_future_prebooked:
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=inj_raw_fcst, mode="lines", name="Prognoză brută (vârf nepreluat)",
+                line=dict(color="#F87171", width=1.5, dash="dot"),
+            )
+        )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=inj_fcst, mode="lines", name="Producție prognozată (CSV T..T+4)",
+            x=xs, y=inj_fcst, mode="lines", name="Producție prognozată (după pre-rezervare T..T+4)",
             line=dict(color="#38BDF8", width=2, dash="dash", shape="spline", smoothing=0.6),
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=sur_pred, mode="lines+markers", name="Surplus prezis de model",
+            x=xs, y=sur_pred, mode="lines+markers", name="Surplus prognozat rămas",
             line=dict(color="#F59E0B", width=2, dash="dot"), marker=dict(size=6),
         )
     )
@@ -478,6 +595,27 @@ with col_main:
         x=t_x, y=1, yref="paper", text=f"T = {t_x.strftime('%H:%M')}", showarrow=False,
         yanchor="bottom", font=dict(color="#FF7B7B", size=11),
     )
+
+    # Anotații pe grafic pentru viitor (T+1..T+4)
+    for f_i in future_idx:
+        f_dt = feed.iloc[f_i]["dt"].to_pydatetime()
+        s_f = predict_step(f_i)[0]
+        if st.session_state.accepted.get(f_i) == "ACCEPTED":
+            fig.add_annotation(
+                x=f_dt, y=limit_line[window.index(f_i)],
+                text=f"✅ T+{f_i - T} REZERVAT",
+                showarrow=True, arrowhead=2, arrowcolor="#00FF9D",
+                font=dict(color="#00FF9D", size=10),
+                bgcolor="#12141b", bordercolor="#00FF9D",
+            )
+        elif s_f > agent.MIN_SURPLUS_THRESHOLD_MW:
+            fig.add_annotation(
+                x=f_dt, y=net_injection_mw(feed.iloc[f_i]),
+                text=f"⚠️ VÂRF T+{f_i - T} ({s_f:.1f} MW)",
+                showarrow=True, arrowhead=2, arrowcolor="#FF4B4B",
+                font=dict(color="#FF7B7B", size=10),
+                bgcolor="#12141b", bordercolor="#FF4B4B",
+            )
     fig.update_layout(
         barmode="stack",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -512,7 +650,7 @@ with col_main:
                 "Status Agent": a["status"],
                 "Ofertă (MW)": a["allocated_mw"],
                 "Preț Fix (€/MWh)": FIXED_PRICE_EUR if a["allocated_mw"] > 0 else 0.0,
-                "Joburi Deblocate": f"{a['jobs']}/{a['queue']}",
+                "Profit PPC (€)": round(a["allocated_mw"] * FIXED_PRICE_EUR, 2),
             }
             for a in allocs_T
         ]
@@ -528,72 +666,170 @@ with col_main:
 
     st.dataframe(
         table.style.map(_status_color, subset=["Status Agent"]).format(
-            {"Temp Răcire (°C)": "{:.1f}", "Capacitate (MW)": "{:.1f}", "Ofertă (MW)": "{:.2f}", "Preț Fix (€/MWh)": "{:.2f}"}
+            {"Temp Răcire (°C)": "{:.1f}", "Capacitate (MW)": "{:.1f}", "Ofertă (MW)": "{:.2f}", "Preț Fix (€/MWh)": "{:.2f}", "Profit PPC (€)": "{:,.2f}"}
         ),
         hide_index=True,
         width="stretch",
     )
 
 # =====================================================================
-# SECONDARY COLUMN: DATACENTER CLIENT VIEW (UPB)
+# SECONDARY COLUMN: DISPATCH & ACADEMIC BATTERY VIEW
 # =====================================================================
 with col_modal:
-    st.markdown('<div class="vc-sub" style="margin-bottom:8px;">DATACENTER CLIENT VIEW</div>', unsafe_allow_html=True)
+    st.markdown('<div class="vc-sub" style="margin-bottom:8px;">DISPECERIZARE & BATERIE VIRTUALĂ</div>', unsafe_allow_html=True)
     upb = next(a for a in allocs_T if a["id"] == "ROEDUNET-UPB-BUC")
 
-    if upb["allocated_mw"] > 0:
+    # CAZUL 1: Există surplus activ la ora curentă T
+    if total_alloc_T > 0:
         window_hours = 1
         for i in future_idx:
             if future_surplus[i] > agent.MIN_SURPLUS_THRESHOLD_MW:
                 window_hours += 1
             else:
                 break
-        savings = upb["allocated_mw"] * window_hours * (REFERENCE_TARIFF_EUR - FIXED_PRICE_EUR)
+
+        status_card = (
+            '<div style="color:#00FF9D;font-weight:700;">● TRANZACȚIE APROBATĂ (REȚEA STABILIZATĂ)</div>'
+            if is_accepted
+            else '<div style="color:#F59E0B;font-weight:700;">⚠️ OFERTĂ ÎN AȘTEPTARE CONFIRMARE</div>'
+        )
+
         st.markdown(
             f"""
 <div class="vc-modal">
-  <div class="vc-modal-head">🔔 ROEDUNET SLURM DAEMON</div>
-  <div class="vc-modal-title">INCOMING POWER DISPATCH OFFER</div>
+  <div class="vc-modal-head">⚡ DISPECERAT PPC // CONTROL SURPLUS (ORA CURENTĂ)</div>
+  <div class="vc-modal-title">ACORD ARBITRAJ ENERGETIC · {row_T['dt'].strftime('%H:%M')}</div>
   <div class="vc-modal-body">
-    PPC Dispatcher oferă <span class="vc-mono" style="color:#00FF9D;">{upb['allocated_mw']:.2f} MW</span> surplus solar
-    pentru următoarele <span class="vc-mono">{window_hours}</span> ore la
-    <span class="vc-mono" style="color:#00FF9D;">{FIXED_PRICE_EUR:.2f} €/MWh</span>
-    (vs <span class="vc-mono">{REFERENCE_TARIFF_EUR:.2f} €/MWh</span> tarif standard).
+    {status_card}
+    <br>
+    PPC redirecționează <span class="vc-mono" style="color:#00FF9D;">{total_alloc_T:.2f} MW</span> surplus către nodurile academice la
+    <span class="vc-mono" style="color:#00FF9D;">{FIXED_PRICE_EUR:.2f} €/MWh</span>.
+    <br><br>
+    💰 <b>Profit generat PPC:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{revenue_T:,.2f} €</span>
+    <br>
+    📉 <b>Degrevare linie PPC:</b> <span class="vc-mono" style="color:#38BDF8;">-{total_alloc_T:.2f} MW</span> (curentul scade sub 10 MW)
   </div>
 </div>
 """,
             unsafe_allow_html=True,
         )
         k1, k2 = st.columns(2)
-        k1.metric("Economie estimată", f"-{savings:,.2f} €")
-        k2.metric("Joburi AI pornite", f"{upb['jobs']}/{upb['queue']}")
+        if is_accepted:
+            k1.metric("Profit Încasat", f"+{revenue_T:,.2f} €", delta="Confirmat PPC")
+            k2.metric("Degrevare Curent", f"-{total_alloc_T:.2f} MW", delta="Rețea stabilă")
+        else:
+            k1.metric("Profit Potențial", f"+{revenue_T:,.2f} €", delta="În așteptare")
+            k2.metric("Surplus de Evacuat", f"{total_alloc_T:.2f} MW", delta="Depășire linie", delta_color="inverse")
 
-        already = st.session_state.accepted.get(T)
-        if already == "ACCEPTED":
-            st.success("Ofertă acceptată pentru acest pas.")
-        elif already == "REFUSED":
-            st.info("Ofertă refuzată pentru acest pas.")
-        b_accept, b_refuse = st.columns(2)
-        if b_accept.button("Acceptă & Scalează GPU-uri", key=f"accept_{T}", type="primary", width="stretch"):
-            st.session_state.accepted[T] = "ACCEPTED"
-            st.toast("✅ GPU Nodes scaled to 100% capacity.")
-            st.rerun()
-        if b_refuse.button("Refuză", key=f"refuse_{T}", width="stretch"):
-            st.session_state.accepted[T] = "REFUSED"
-            st.toast("Ofertă refuzată de administratorul UPB.")
-            st.rerun()
-    else:
-        reason = (
-            "Încredere model sub prag - decizie la dispecer."
-            if surplus_T > agent.MIN_SURPLUS_THRESHOLD_MW
-            else f"Surplus {surplus_T:.2f} MW sub pragul de {agent.MIN_SURPLUS_THRESHOLD_MW:.1f} MW."
+        if is_accepted:
+            st.success(f"✅ Tranzacție executată! +{revenue_T:,.2f} € profit încasat de PPC, surplus evacuat: {total_alloc_T:.2f} MW.")
+            if st.button("↩️ Anulează Tranzacția (Revino la starea brută)", key=f"reset_{T}", width="stretch"):
+                st.session_state.accepted[T] = None
+                st.toast("Tranzacție anulată - rețeaua a revenit la surplusul inițial.")
+                st.rerun()
+        elif is_refused:
+            st.info("Tranzacție refuzată de dispecer. Surplusul rămâne în rețea.")
+            if st.button("Reevaluează Tranzacția", key=f"reval_{T}", width="stretch"):
+                st.session_state.accepted[T] = None
+                st.rerun()
+        else:
+            b_accept, b_refuse = st.columns([1.7, 1])
+            if b_accept.button(f"⚡ Aprobă & Încasează (+{revenue_T:,.2f} €)", key=f"accept_{T}", type="primary", width="stretch"):
+                st.session_state.accepted[T] = "ACCEPTED"
+                st.toast(f"✅ Dispecerizare aprobată! Profit: +{revenue_T:,.2f} €, Rețea degrevată cu {total_alloc_T:.2f} MW.")
+                st.rerun()
+            if b_refuse.button("Refuză", key=f"refuse_{T}", width="stretch"):
+                st.session_state.accepted[T] = "REFUSED"
+                st.toast("Tranzacție refuzată de dispecer.")
+                st.rerun()
+
+        # Posibilitate de pre-rezervare și pentru un vârf viitor
+        if has_upcoming_spike:
+            spike_row = feed.iloc[first_spike_idx]
+            spike_dt = spike_row["dt"]
+            lead_h = first_spike_idx - T
+            s_spike, c_spike, _ = predict_step(first_spike_idx)
+            allocs_spike = allocate(s_spike, c_spike)
+            alloc_spike_mw = round(sum(a["allocated_mw"] for a in allocs_spike), 2)
+            profit_spike = round(alloc_spike_mw * FIXED_PRICE_EUR, 2)
+            is_spike_prebooked = (st.session_state.accepted.get(first_spike_idx) == "ACCEPTED")
+
+            st.markdown('<hr style="border-color:rgba(255,255,255,0.08);margin:12px 0;">', unsafe_allow_html=True)
+            st.markdown(f'<div class="vc-sub">🔮 PRE-DISPECERIZARE VIITOR (T+{lead_h}h · {spike_dt.strftime("%H:%M")})</div>', unsafe_allow_html=True)
+            if is_spike_prebooked:
+                st.success(f"✅ Vârf {spike_dt.strftime('%H:%M')} (+{profit_spike:,.2f} €) deja pre-rezervat.")
+            else:
+                if st.button(f"⚡ Pre-rezervă și Vârful T+{lead_h}h ({spike_dt.strftime('%H:%M')}) (+{profit_spike:,.2f} €)", key=f"book_next_{first_spike_idx}", width="stretch"):
+                    st.session_state.accepted[first_spike_idx] = "ACCEPTED"
+                    st.toast(f"✅ Vârf viitor pre-rezervat pentru {spike_dt.strftime('%H:%M')}!")
+                    st.rerun()
+
+    # CAZUL 2: La ora curentă T nu e surplus, DAR urmează un spike în lookahead (T+2)
+    elif has_upcoming_spike:
+        spike_row = feed.iloc[first_spike_idx]
+        spike_dt = spike_row["dt"]
+        lead_h = first_spike_idx - T
+        s_spike, c_spike, _ = predict_step(first_spike_idx)
+        allocs_spike = allocate(s_spike, c_spike)
+        alloc_spike_mw = round(sum(a["allocated_mw"] for a in allocs_spike), 2)
+        profit_spike = round(alloc_spike_mw * FIXED_PRICE_EUR, 2)
+        is_spike_prebooked = (st.session_state.accepted.get(first_spike_idx) == "ACCEPTED")
+
+        status_card = (
+            '<div style="color:#00FF9D;font-weight:700;">● PRE-REZERVARE ACTIVĂ (VÂRF TĂIAT ÎN AVANS)</div>'
+            if is_spike_prebooked
+            else f'<div style="color:#F59E0B;font-weight:700;">⚠️ PREAVIZ DE REȚEA: SPIKE PESTE {lead_h} ORE</div>'
         )
+
         st.markdown(
             f"""
 <div class="vc-modal">
-  <div class="vc-modal-head">🔔 ROEDUNET SLURM DAEMON</div>
-  <div class="vc-modal-title">NO ACTIVE OFFER</div>
-  <div class="vc-modal-body">{reason} Cluster-ul rămâne pe alimentare standard.</div>
+  <div class="vc-modal-head">🔔 PRE-DISPECERIZARE ANTICIPATĂ // LOOKAHEAD T+{lead_h}h</div>
+  <div class="vc-modal-title">SPIKE SOLAR PROGNOZAT LA {spike_dt.strftime('%H:%M')}</div>
+  <div class="vc-modal-body">
+    {status_card}
+    <br>
+    Modelul AI prognozează un surplus critic de <span class="vc-mono" style="color:#FF7B7B;">{s_spike:.2f} MW</span>
+    la ora <span class="vc-mono" style="color:#FFFFFF;">{spike_dt.strftime('%H:%M')}</span> (în {lead_h} ore), depășind limita liniei de 10 MW!
+    <br><br>
+    ⚡ <b>De ce pre-rezervăm cu 2 ore înainte?</b><br>
+    Permite clusterului UPB să coboare temperatura camerelor de servere și să aloce nodurile Slurm în avans, fără șoc termic.
+    <br><br>
+    💰 <b>Profit viitor securizat:</b> <span class="vc-mono" style="color:#00FF9D;font-size:1.05rem;">+{profit_spike:,.2f} €</span>
+    <br>
+    📉 <b>Degrevare viitoare prognozată:</b> <span class="vc-mono" style="color:#38BDF8;">-{alloc_spike_mw:.2f} MW</span> (vârf tăiat în avans)
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        k1, k2 = st.columns(2)
+        if is_spike_prebooked:
+            k1.metric(f"Profit Securizat ({spike_dt.strftime('%H:%M')})", f"+{profit_spike:,.2f} €", delta="Pre-rezervat ✅")
+            k2.metric(f"Vârf Tăiat ({spike_dt.strftime('%H:%M')})", f"-{alloc_spike_mw:.2f} MW", delta="Sub 10 MW ✅")
+            st.success(f"✅ Vârf pre-rezervat pentru ora {spike_dt.strftime('%H:%M')}! Curba din grafic este tăiată în avans.")
+            if st.button(f"↩️ Anulează Pre-rezervarea ({spike_dt.strftime('%H:%M')})", key=f"reset_spike_{first_spike_idx}", width="stretch"):
+                st.session_state.accepted[first_spike_idx] = None
+                st.toast(f"Pre-rezervare anulată pentru ora {spike_dt.strftime('%H:%M')}.")
+                st.rerun()
+        else:
+            k1.metric("Profit Viitor", f"+{profit_spike:,.2f} €", delta=f"La {spike_dt.strftime('%H:%M')}")
+            k2.metric("Spike Prognozat", f"{s_spike:.2f} MW", delta=f"În {lead_h}h", delta_color="inverse")
+            if st.button(f"⚡ Pre-rezervă Bateria Virtuală ({spike_dt.strftime('%H:%M')}) (+{profit_spike:,.2f} €)", key=f"book_spike_{first_spike_idx}", type="primary", width="stretch"):
+                st.session_state.accepted[first_spike_idx] = "ACCEPTED"
+                st.toast(f"✅ Pre-rezervare confirmată pentru ora {spike_dt.strftime('%H:%M')}! Vârful a fost tăiat.")
+                st.rerun()
+
+    # CAZUL 3: Nici la T și nici în viitorul apropiat nu se prognozează surplus
+    else:
+        st.markdown(
+            f"""
+<div class="vc-modal">
+  <div class="vc-modal-head">⚡ DISPECERAT PPC // REȚEA NOMINALĂ</div>
+  <div class="vc-modal-title">FĂRĂ CONGESTIE PROGNOZATĂ</div>
+  <div class="vc-modal-body">
+    Nici la ora {row_T['dt'].strftime('%H:%M')} și nici în următoarele {LOOKAHEAD_HOURS} ore nu se prognozează depășirea limitei liniei PPC de 10.0 MW. Sistemul funcționează în regim nominal standard.
+  </div>
 </div>
 """,
             unsafe_allow_html=True,

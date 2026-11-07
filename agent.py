@@ -13,7 +13,7 @@ from schemas import (
     ResearchCenterTelemetry,
 )
 
-DEFAULT_MODEL_PATH = Path("model.joblib")
+DEFAULT_MODEL_PATH = Path("models/model_surplus.pkl")
 
 
 class VoltComputeAgent:
@@ -40,7 +40,12 @@ class VoltComputeAgent:
 
     def _load_model(self) -> None:
         """Încarcă modelul XGBoost din model.joblib sau models/model_surplus.pkl dacă este disponibil."""
-        candidate_paths = [Path("model.joblib"), Path("models/model.joblib"), self.model_path]
+        candidate_paths = [
+            self.model_path,
+            Path("models/model_surplus.pkl"),
+            Path("model.joblib"),
+            Path("models/model.joblib"),
+        ]
         for p in candidate_paths:
             if p.exists():
                 try:
