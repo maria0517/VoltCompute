@@ -13,7 +13,7 @@ from schemas import (
     ResearchCenterTelemetry,
 )
 
-DEFAULT_MODEL_PATH = Path("models/model_surplus.pkl")
+DEFAULT_MODEL_PATH = Path("model.joblib")
 
 
 class VoltComputeAgent:
@@ -39,17 +39,25 @@ class VoltComputeAgent:
         self._load_model()
 
     def _load_model(self) -> None:
-        """Încarcă modelul XGBoost din models/model_surplus.pkl dacă este disponibil."""
-        if self.model_path.exists():
-            try:
-                with open(self.model_path, "rb") as f:
-                    loaded = pickle.load(f)
-                if isinstance(loaded, dict) and "model" in loaded:
-                    self.model_artifact = loaded
-                else:
-                    self.model_artifact = {"model": loaded}
-            except Exception:
-                self.model_artifact = None
+        """Încarcă modelul XGBoost din model.joblib sau models/model_surplus.pkl dacă este disponibil."""
+        candidate_paths = [Path("model.joblib"), Path("models/model.joblib"), self.model_path]
+        for p in candidate_paths:
+            if p.exists():
+                try:
+                    if str(p).endswith(".joblib"):
+                        import joblib
+                        loaded = joblib.load(p)
+                    else:
+                        with open(p, "rb") as f:
+                            loaded = pickle.load(f)
+                    if isinstance(loaded, dict) and "model" in loaded:
+                        self.model_artifact = loaded
+                    else:
+                        self.model_artifact = {"model": loaded}
+                    return
+                except Exception:
+                    continue
+        self.model_artifact = None
 
     def perceive(
         self,
