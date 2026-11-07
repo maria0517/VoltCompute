@@ -12,6 +12,7 @@ from schemas import (
     GridTelemetry,
     ResearchCenterTelemetry,
 )
+from services.router import FIXED_TARIFF_EUR_MWH, OfferPool, load_profiles, rank_datacenters
 from simulator import SCENARIO_DESCRIPTIONS, VoltComputeSimulator
 
 app = FastAPI(
@@ -37,6 +38,22 @@ simulator = VoltComputeSimulator(agent=agent)
 # Registru in-memory pentru auditul deciziilor și acțiunilor Human-in-the-Loop
 DECISION_STORE: Dict[str, AgentDecision] = {}
 DISPATCH_LOG: List[Dict[str, Any]] = []
+
+
+class DCTelemetry(BaseModel):
+    """Telemetria curentă a unui Data Center pentru clasare."""
+
+    id: str
+    free_capacity_mw: float
+    temp_c: float
+
+
+class RankRequest(BaseModel):
+    """Payload pentru POST /api/router/rank."""
+
+    surplus_mw: float
+    datacenters: List[DCTelemetry]
+    rejected_ids: List[str] = []
 
 
 class EvaluateRequest(BaseModel):
@@ -135,3 +152,29 @@ def run_simulation(scenario_name: str) -> Dict[str, Any]:
         "timeline": timeline,
     }
 
+
+
+@app.post("/api/router/rank")
+def rank_and_route(payload: RankRequest) -> Dict[str, Any]:
+    """
+    DECIDE + ACT: clasează Data Center-ele după Match Score (istoric din dc_profiles_and_history.json)
+    și întoarce oferta curentă la tarif fix. Nodurile din `rejected_ids` au refuzat deja
+    (prețul nu scade; oferta sare la următorul nod) -> ALL_DCS_EXHAUSTED dacă nu mai rămâne niciunul.
+    """
+    history = {dc["id"]: dc["history"] for dc in load_profiles()["datacenters"]}
+    candidates = [
+        {
+            **dc.model_dump(),
+            "offers_sent": history.get(dc.id, {}).get("offers_sent", 0),
+            "offers_accepted": history.get(dc.id, {}).get("offers_accepted", 0),
+        }
+        for dc in payload.datacenters
+    ]
+    pool = OfferPool(payload.surplus_mw, rank_datacenters(payload.surplus_mw, candidates))
+    pool.rejected = [i for i in payload.rejected_ids if any(c["id"] == i for c in candidates)]
+    return {
+        "tariff_eur_mwh": FIXED_TARIFF_EUR_MWH,
+        "pool_status": pool.status,
+        "current_offer": pool.current_offer(),
+        "ranking": pool.ranking,
+    }
