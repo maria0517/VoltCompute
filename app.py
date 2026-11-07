@@ -7,17 +7,16 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.ensemble import HistGradientBoostingRegressor
 
 from agent import VoltComputeAgent
 from schemas import GridTelemetry
 from simulator import VoltComputeSimulator
 from train import (
-    DATA_PATH,
-    ENGINEERED_FEATURE_COLUMNS,
-    TARGET_COLUMN,
-    add_engineered_features,
-    generate_synthetic_dataset,
+    LIVE_TEST_DATA_PATH,
+    MODEL_PATH,
+    TRAIN_DATA_PATH,
+    ensure_split_datasets,
+    train_pipeline,
 )
 
 st.set_page_config(
@@ -148,49 +147,61 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
 )
 
 # =====================================================================
-# DATA, MODEL & AGENT
+# DATA (TRAIN vs LIVE OUT-OF-SAMPLE RING BUFFER), MODEL & AGENT
 # =====================================================================
 
 
 @st.cache_data(show_spinner=False)
-def load_feed() -> Tuple[pd.DataFrame, str]:
-    """Încarcă CSV-ul cronologic; dacă lipsește, generează 48h realiste la runtime."""
-    if Path(DATA_PATH).exists():
-        df = pd.read_csv(DATA_PATH)
-        source = str(DATA_PATH)
-    else:
-        df = generate_synthetic_dataset(n_hours=48)
-        source = "synthetic runtime feed (48h)"
-    df = df.reset_index(drop=True)
-    df["dt"] = pd.to_datetime(df["timestamp"])
-    if "gross_solar_mw" not in df.columns:
-        derating = 1.0 - np.maximum(0.0, (df["ambient_temp_celsius"] - 25.0) * 0.004)
-        df["gross_solar_mw"] = df["solar_irradiance_wm2"] / 1000.0 * 17.8 * derating
-    return df, source
+def load_feed() -> Tuple[pd.DataFrame, int, str]:
+    """
+    Încarcă EXCLUSIV setul de date noi (out-of-sample) `data/live_test_energy_data.csv`
+    (pe care modelul NU a fost antrenat niciodată) pentru a fi rulat în Ring Buffer continuu.
+    """
+    train_df, live_df = ensure_split_datasets()
+    live_df = live_df.reset_index(drop=True)
+    live_df["dt"] = pd.to_datetime(live_df["timestamp"])
+    if "gross_solar_mw" not in live_df.columns:
+        derating = 1.0 - np.maximum(0.0, (live_df["ambient_temp_celsius"] - 25.0) * 0.004)
+        live_df["gross_solar_mw"] = live_df["solar_irradiance_wm2"] / 1000.0 * 17.8 * derating
+    if "net_injection_mw" not in live_df.columns:
+        local_load = 1.4 + 0.5 * np.sin(np.pi * live_df["hour"] / 12.0)
+        live_df["net_injection_mw"] = np.maximum(0.0, live_df["gross_solar_mw"] - local_load)
+    source = f"{LIVE_TEST_DATA_PATH} (Date Noi Out-of-Sample)"
+    return live_df, len(train_df), source
 
 
-def ensure_model(agent: VoltComputeAgent, feed: pd.DataFrame) -> str:
-    """Folosește models/model_surplus.pkl; dacă lipsește, antrenează un HistGradientBoosting."""
+def ensure_model(agent: VoltComputeAgent) -> str:
+    """
+    Asigură că modelul este antrenat EXCLUSIV pe setul de antrenare `train_energy_data.csv`
+    (1152h) și niciodată pe setul de date noi din live feed.
+    """
+    if (
+        agent.model_artifact is None
+        or "model" not in agent.model_artifact
+        or "injection_model" not in agent.model_artifact
+    ):
+        train_pipeline()
+        agent._load_model()
     if agent.model_artifact is not None and "model" in agent.model_artifact:
-        return "model_surplus.pkl"
-    if TARGET_COLUMN in feed.columns:
-        engineered = add_engineered_features(feed)
-        model = HistGradientBoostingRegressor(max_iter=200, max_depth=5, learning_rate=0.05, random_state=42)
-        model.fit(engineered[ENGINEERED_FEATURE_COLUMNS], engineered[TARGET_COLUMN])
-        agent.model_artifact = {"model": model, "feature_columns": ENGINEERED_FEATURE_COLUMNS}
-        return "HistGradientBoosting (runtime fallback)"
+        return f"model_surplus.pkl (antrenat pe {TRAIN_DATA_PATH.name})"
     return "physics fallback"
 
 
-feed, feed_source = load_feed()
-N_ROWS = len(feed)
-MAX_STEP = max(0, N_ROWS - 1 - LOOKAHEAD_HOURS)
+feed, N_TRAIN_ROWS, feed_source = load_feed()
+N_ROWS = len(feed)  # 288h (12 zile complete 00:00 -> 23:00 pentru Ring Buffer fără discontinuitate)
+BASE_LIVE_DT: datetime = feed.iloc[0]["dt"].to_pydatetime()
 # Scală verticală fixă pentru grafic, ca axa să nu "sară" la fiecare tick (ca pe un terminal de bursă)
 Y_AXIS_MAX = float(feed["gross_solar_mw"].max()) * 1.08 + 0.5
 
-if "agent" not in st.session_state:
-    st.session_state.agent = VoltComputeAgent()
-    st.session_state.model_source = ensure_model(st.session_state.agent, feed)
+if (
+    "agent" not in st.session_state
+    or not hasattr(st.session_state.agent, "estimate_injection")
+    or "injection_model" not in (st.session_state.agent.model_artifact or {})
+):
+    st.session_state.agent = VoltComputeAgent(model_path=MODEL_PATH)
+    st.session_state.model_source = ensure_model(st.session_state.agent)
+    st.session_state.pred_cache = {}
+
 if "pred_cache" not in st.session_state:
     st.session_state.pred_cache = {}
 if "autoplay" not in st.session_state:
@@ -199,44 +210,108 @@ if "pending_advance" not in st.session_state:
     st.session_state.pending_advance = False
 if "accepted" not in st.session_state:
     st.session_state.accepted = {}
+if "ring_cycle" not in st.session_state:
+    st.session_state.ring_cycle = 0
 if "current_step" not in st.session_state:
-    candidates = feed[(feed["hour"] == 13) & (feed.get("surplus_mw", 0) > 4.0)] if "surplus_mw" in feed.columns else feed.iloc[0:0]
-    if len(candidates) > 0:
+    candidates = (
+        feed[(feed["hour"] == 13) & (feed.get("surplus_mw", 0) > 3.5)]
+        if "surplus_mw" in feed.columns
+        else feed.iloc[0:0]
+    )
+    if len(candidates) > 1:
+        default_step = int(candidates.index[1])
+    elif len(candidates) > 0:
         default_step = int(candidates.index[0])
     else:
         noon = feed[feed["hour"].isin([12, 13])]
-        default_step = int(noon.index[0]) if len(noon) > 0 else 0
-    st.session_state.current_step = int(min(default_step, MAX_STEP))
+        default_step = int(noon.index[0]) if len(noon) > 0 else 13
+    st.session_state.current_step = int(default_step % N_ROWS)
 
-# Avansarea automată trebuie aplicată înainte ca widgetul slider să fie creat
+# Avansarea automată în Ring Buffer (fără oprire la capăt; trece lin din 23:00 în 00:00)
 if st.session_state.pending_advance:
     st.session_state.pending_advance = False
-    st.session_state.current_step = int(min(MAX_STEP, st.session_state.current_step + 1))
+    nxt_step = int(st.session_state.current_step) + 1
+    if nxt_step >= N_ROWS:
+        st.session_state.current_step = 0
+        st.session_state.ring_cycle = int(st.session_state.ring_cycle) + 1
+    else:
+        st.session_state.current_step = nxt_step
 
 agent: VoltComputeAgent = st.session_state.agent
 
 
-def net_injection_mw(row: pd.Series) -> float:
-    local_load = 1.4 + 0.5 * float(np.sin(np.pi * int(row["hour"]) / 12.0))
-    return round(max(0.0, float(row["gross_solar_mw"]) - local_load), 3)
+def _ring_row(v_idx: int) -> pd.Series:
+    """Returnează rândul din Ring Buffer corespunzător indexului virtual continuu `v_idx`."""
+    return feed.iloc[v_idx % N_ROWS]
 
 
-def predict_step(idx: int) -> Tuple[float, float, Dict[str, float]]:
-    """Surplus prezis de model (agent.estimate) pentru rândul `idx` din CSV."""
+def _ring_dt(v_idx: int) -> datetime:
+    """Returnează timestamp-ul continuu monoton pentru indexul virtual `v_idx` din Ring Buffer."""
+    return BASE_LIVE_DT + timedelta(hours=int(v_idx))
+
+
+def _cycle_variation(v_idx: int) -> Tuple[float, float, float]:
+    """
+    La ciclurile ulterioare ale Ring Buffer-ului (`v_cycle != 0`), aplică o micro-variație
+    stocastică deterministă (nor tranzitoriu + fluctuație de sarcină) astfel încât fluxul live
+    să genereze mereu date noi, fără să repete identic aceiași megawați.
+    """
+    v_cycle = v_idx // N_ROWS
+    if v_cycle == 0:
+        return 1.0, 0.0, 0.0
+    rng = np.random.default_rng(seed=100_003 + int(v_idx) * 31)
+    irr_factor = float(np.clip(1.0 + rng.normal(0.0, 0.045), 0.88, 1.12))
+    temp_offset = float(rng.normal(0.0, 0.6))
+    inj_noise = float(rng.normal(0.0, 0.28))
+    return irr_factor, temp_offset, inj_noise
+
+
+def net_injection_mw(v_idx: int) -> float:
+    """
+    Valoarea REALĂ (Ground Truth) a injecției nete măsurate în rețea la pasul `v_idx`
+    din setul de date noi (include fluctuațiile reale de nori și consum local).
+    """
+    row = _ring_row(v_idx)
+    irr_factor, _, inj_noise = _cycle_variation(v_idx)
+    base_real_inj = float(row["net_injection_mw"])
+    if int(row["hour"]) < 6 or int(row["hour"]) > 19 or base_real_inj <= 0.01:
+        return 0.0
+    return round(max(0.0, base_real_inj * irr_factor + inj_noise), 3)
+
+
+def real_surplus_mw(v_idx: int) -> float:
+    """Surplusul REAL măsurat în rețea peste limita liniei la pasul `v_idx`."""
+    row = _ring_row(v_idx)
+    lim = float(row.get("grid_capacity_limit_mw", 10.0))
+    return round(max(0.0, net_injection_mw(v_idx) - lim), 3)
+
+
+def predict_step(v_idx: int) -> Tuple[float, float, Dict[str, float], float]:
+    """
+    Calculează predicția modelului AI (antrenat DOAR pe train_energy_data.csv)
+    pe datele noi din Ring Buffer la pasul `v_idx`:
+    returnează (surplus_predicted_mw, confidence, shap_dict, predicted_injection_mw).
+    """
     cache = st.session_state.pred_cache
-    if idx not in cache:
-        row = feed.iloc[idx]
+    if v_idx not in cache or len(cache[v_idx]) != 4:
+        row = _ring_row(v_idx)
+        irr_factor, temp_offset, _ = _cycle_variation(v_idx)
+        dt_val = _ring_dt(v_idx)
+        irr_val = float(np.clip(float(row["solar_irradiance_wm2"]) * irr_factor, 0.0, 1400.0))
+        temp_val = float(np.clip(float(row["ambient_temp_celsius"]) + temp_offset, -20.0, 55.0))
         grid = GridTelemetry(
-            timestamp=str(row["timestamp"]),
+            timestamp=dt_val.isoformat(),
             hour=int(row["hour"]),
-            solar_irradiance_wm2=float(row["solar_irradiance_wm2"]),
-            ambient_temp_celsius=float(row["ambient_temp_celsius"]),
+            solar_irradiance_wm2=round(irr_val, 2),
+            ambient_temp_celsius=round(temp_val, 2),
             day_ahead_price_eur=float(row["day_ahead_price_eur"]),
             grid_capacity_limit_mw=float(row.get("grid_capacity_limit_mw", 10.0)),
-            is_weekend=int(row["dt"].day_of_week >= 5),
+            is_weekend=int(dt_val.weekday() >= 5),
         )
-        cache[idx] = agent.estimate(grid)
-    return cache[idx]
+        surplus_pred, conf, shap_dict = agent.estimate(grid)
+        inj_pred = agent.estimate_injection(grid)
+        cache[v_idx] = (surplus_pred, conf, shap_dict, inj_pred)
+    return cache[v_idx]
 
 
 def allocate(surplus: float, confidence: float) -> List[Dict[str, Any]]:
@@ -285,36 +360,54 @@ def allocate(surplus: float, confidence: float) -> List[Dict[str, Any]]:
 # =====================================================================
 # HEADER + TIMELINE CONTROL BAR
 # =====================================================================
-st.markdown(
-    f"""
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-  <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH</div>
-  <div class="vc-sub">FEED: {feed_source} · MODEL: {st.session_state.model_source} · {N_ROWS}h</div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-
 def _step_back() -> None:
     st.session_state.autoplay = False
-    st.session_state.current_step = max(0, int(st.session_state.current_step) - 1)
+    prv = int(st.session_state.current_step) - 1
+    if prv < 0:
+        st.session_state.current_step = N_ROWS - 1
+        st.session_state.ring_cycle = int(st.session_state.ring_cycle) - 1
+    else:
+        st.session_state.current_step = prv
 
 
 def _step_forward() -> None:
     st.session_state.autoplay = False
-    st.session_state.current_step = min(MAX_STEP, int(st.session_state.current_step) + 1)
+    nxt = int(st.session_state.current_step) + 1
+    if nxt >= N_ROWS:
+        st.session_state.current_step = 0
+        st.session_state.ring_cycle = int(st.session_state.ring_cycle) + 1
+    else:
+        st.session_state.current_step = nxt
 
 
 def _toggle_play() -> None:
     st.session_state.autoplay = not st.session_state.autoplay
 
 
+abs_T = int(st.session_state.ring_cycle) * N_ROWS + int(st.session_state.current_step)
+# Calculăm eroarea MAE live pe ultimele 24h (doar orele de zi cu activitate solară) pentru afișare transparentă
+_day_hist_errors = [
+    abs(net_injection_mw(i) - predict_step(i)[3])
+    for i in range(abs_T - HISTORY_HOURS, abs_T + 1)
+    if 7 <= int(_ring_row(i)["hour"]) <= 18
+]
+live_window_mae = float(np.mean(_day_hist_errors)) if _day_hist_errors else 0.42
+
+st.markdown(
+    f"""
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+  <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH</div>
+  <div class="vc-sub">TRAIN SET: {N_TRAIN_ROWS}h · LIVE RING BUFFER: {N_ROWS}h Date Noi (Ciclu #{int(st.session_state.ring_cycle) + 1}) · MAE Live (24h): ±{live_window_mae:.2f} MW</div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
 bar_back, bar_fwd, bar_play, bar_slider = st.columns([1, 1, 1.7, 5], gap="small")
 bar_back.button("◀ Pas Înapoi", on_click=_step_back, width="stretch")
 bar_fwd.button("▶ Pas Înainte", on_click=_step_forward, width="stretch")
 bar_play.button(
-    "⏹ Stop Live Feed" if st.session_state.autoplay else "▶▶ Play Live Feed (Auto-step 1s)",
+    "⏹ Stop Live Feed" if st.session_state.autoplay else "▶▶ Play Live Feed (Ring Buffer Continuu 1s)",
     on_click=_toggle_play,
     type="primary",
     width="stretch",
@@ -322,18 +415,19 @@ bar_play.button(
 with bar_slider:
     st.select_slider(
         "Timeline",
-        options=list(range(MAX_STEP + 1)),
+        options=list(range(N_ROWS)),
         key="current_step",
         format_func=lambda i: feed.iloc[i]["dt"].strftime("%Y-%m-%d %H:%M"),
         label_visibility="collapsed",
     )
 
 # =====================================================================
-# STATE AT STEP T + LOOKAHEAD T+1..T+4
+# STATE AT STEP T + LOOKAHEAD T+1..T+4 (IN RING BUFFER)
 # =====================================================================
-T = int(st.session_state.current_step)
-row_T = feed.iloc[T]
-surplus_T, conf_T, shap_T = predict_step(T)
+T = int(st.session_state.ring_cycle) * N_ROWS + int(st.session_state.current_step)
+row_T = _ring_row(T)
+dt_T = _ring_dt(T)
+surplus_T, conf_T, shap_T, pred_inj_T = predict_step(T)
 allocs_T = allocate(surplus_T, conf_T)
 total_alloc_T = round(sum(a["allocated_mw"] for a in allocs_T), 2)
 revenue_T = round(total_alloc_T * FIXED_PRICE_EUR, 2)
@@ -341,10 +435,11 @@ revenue_T = round(total_alloc_T * FIXED_PRICE_EUR, 2)
 is_accepted = (st.session_state.accepted.get(T) == "ACCEPTED")
 is_refused = (st.session_state.accepted.get(T) == "REFUSED")
 
-# Calcul profit cumulat pe întreaga sesiune din ofertele aprobate
+
 def _get_alloc_for_step(step_idx: int) -> float:
-    s_val, c_val, _ = predict_step(step_idx)
+    s_val, c_val, _, _ = predict_step(step_idx)
     return round(sum(a["allocated_mw"] for a in allocate(s_val, c_val)), 2)
+
 
 cumulative_profit = sum(
     _get_alloc_for_step(idx) * FIXED_PRICE_EUR
@@ -352,14 +447,14 @@ cumulative_profit = sum(
     if status == "ACCEPTED"
 )
 
-# Curentul (injecția netă) și surplusul înainte vs după dispecerizare
-raw_injection_T = net_injection_mw(row_T)
+# Curentul real (injecția netă măsurată în teren) vs predicția AI și după dispecerizare
+raw_injection_T = net_injection_mw(T)
 actual_injection_T = max(0.0, raw_injection_T - total_alloc_T) if is_accepted else raw_injection_T
 grid_limit_mw = float(row_T.get("grid_capacity_limit_mw", 10.0))
 actual_surplus_T = max(0.0, actual_injection_T - grid_limit_mw) if is_accepted else surplus_T
 actual_profit_T = revenue_T if is_accepted else 0.0
 
-future_idx = [i for i in range(T + 1, min(N_ROWS, T + 1 + LOOKAHEAD_HOURS))]
+future_idx = [T + k for k in range(1, LOOKAHEAD_HOURS + 1)]
 future_surplus = {i: predict_step(i)[0] for i in future_idx}
 upcoming_spikes = [i for i in future_idx if predict_step(i)[0] > agent.MIN_SURPLUS_THRESHOLD_MW]
 has_upcoming_spike = len(upcoming_spikes) > 0
@@ -372,14 +467,14 @@ peak_idx, peak_mw = max(peak_candidates, key=lambda x: x[1])
 if is_accepted and total_alloc_T > 0:
     alert_html = (
         f'<div class="vc-alert vc-alert-green">✅ REȚEA STABILIZATĂ: Surplusul de {total_alloc_T:.2f} MW '
-        f'a fost evacuat la nodurile universitare la {row_T["dt"].strftime("%H:%M")}! '
+        f'a fost evacuat la nodurile universitare la {dt_T.strftime("%H:%M")}! '
         f'Curentul a scăzut de la {raw_injection_T:.2f} MW la {actual_injection_T:.2f} MW · '
         f'Profit PPC confirmat: +{actual_profit_T:,.2f} €</div>'
     )
 elif has_upcoming_spike and total_alloc_T == 0:
     s_lead = predict_step(first_spike_idx)[0]
     lead_h = first_spike_idx - T
-    t_lead_str = feed.iloc[first_spike_idx]["dt"].strftime("%H:%M")
+    t_lead_str = _ring_dt(first_spike_idx).strftime("%H:%M")
     if is_first_spike_prebooked:
         alert_html = (
             f'<div class="vc-alert vc-alert-green">✅ PRE-DISPECERIZARE ACTIVĂ (T+{lead_h}): '
@@ -395,7 +490,7 @@ elif has_upcoming_spike and total_alloc_T == 0:
 elif peak_mw > 0.05:
     alert_html = (
         f'<div class="vc-alert vc-alert-red">⚠️ ALERTĂ CURTAILMENT: Vârf de surplus de {peak_mw:.1f} MW '
-        f'detectat în următoarele ore (la {feed.iloc[peak_idx]["dt"].strftime("%H:%M")}, peste limita liniei de '
+        f'detectat în următoarele ore (la {_ring_dt(peak_idx).strftime("%H:%M")}, peste limita liniei de '
         f'{grid_limit_mw:.0f} MW) · Aprobă dispecerizarea pentru evacuare și profit!</div>'
     )
 else:
@@ -416,7 +511,7 @@ with col_main:
     m1.metric(
         "Iradiere Curentă",
         f"{float(row_T['solar_irradiance_wm2']):.0f} W/m²",
-        f"{row_T['dt'].strftime('%H:%M')} · {float(row_T['ambient_temp_celsius']):.1f}°C",
+        f"{dt_T.strftime('%H:%M')} · {float(row_T['ambient_temp_celsius']):.1f}°C",
     )
     if is_accepted:
         m2.metric(
@@ -439,15 +534,15 @@ with col_main:
         )
     else:
         m2.metric(
-            "Injecție Rețea PPC",
+            "Injecție Rețea PPC (Real)",
             f"{raw_injection_T:.2f} MW",
-            f"limită linie: {grid_limit_mw:.0f} MW",
+            f"Predicție AI: {pred_inj_T:.2f} MW (Δ {pred_inj_T - raw_injection_T:+.2f} MW)",
             delta_color="inverse" if raw_injection_T > grid_limit_mw else "off",
         )
         m3.metric(
-            "Surplus de Arbitrat",
+            "Surplus Prezis AI",
             f"{surplus_T:.2f} MW",
-            f"{total_alloc_T:.2f} MW ofertabili" if total_alloc_T > 0 else "nominal",
+            f"Real în rețea: {real_surplus_mw(T):.2f} MW · Conf: {conf_T * 100:.0f}%",
             delta_color="inverse" if surplus_T > 2.0 else "off",
         )
         m4.metric(
@@ -457,53 +552,63 @@ with col_main:
             delta_color="normal" if revenue_T > 0 else "off",
         )
 
-    # ---------------- Live ticker chart ----------------
-    start_i = max(0, T - HISTORY_HOURS)
-    end_i = min(N_ROWS - 1, T + LOOKAHEAD_HOURS)
+    # ---------------- Live ticker chart (Ring Buffer Continuu) ----------------
+    start_i = T - HISTORY_HOURS
+    end_i = T + LOOKAHEAD_HOURS
     window = list(range(start_i, end_i + 1))
-    xs = [feed.iloc[i]["dt"].to_pydatetime() for i in window]
-    limit_line = [float(feed.iloc[i].get("grid_capacity_limit_mw", 10.0)) for i in window]
+    xs = [_ring_dt(i) for i in window]
+    limit_line = [float(_ring_row(i).get("grid_capacity_limit_mw", 10.0)) for i in window]
 
-    def _dispatched_inj_for_step(step_idx: int) -> float:
-        raw = net_injection_mw(feed.iloc[step_idx])
+    def _dispatched_real_inj_for_step(step_idx: int) -> float:
+        """Valoarea reală măsurată în rețea (minus dispecerizare dacă e aprobată)."""
+        raw = net_injection_mw(step_idx)
         if st.session_state.accepted.get(step_idx) == "ACCEPTED":
             alloc_val = _get_alloc_for_step(step_idx)
             return max(0.0, raw - alloc_val)
         return raw
 
-    inj_hist = [_dispatched_inj_for_step(i) if i <= T else None for i in window]
-    inj_raw_hist = [net_injection_mw(feed.iloc[i]) if i <= T else None for i in window]
-    inj_fcst = [_dispatched_inj_for_step(i) if i >= T else None for i in window]
-    inj_raw_fcst = [net_injection_mw(feed.iloc[i]) if i >= T else None for i in window]
-
-    def _dispatched_surplus_for_step(step_idx: int) -> float:
+    def _dispatched_ai_pred_inj_for_step(step_idx: int) -> float:
+        """Valoarea prezisă de modelul AI pe setul de date noi (minus dispecerizare dacă e aprobată)."""
+        pred_raw = predict_step(step_idx)[3]
         if st.session_state.accepted.get(step_idx) == "ACCEPTED":
-            disp = _dispatched_inj_for_step(step_idx)
-            lim = float(feed.iloc[step_idx].get("grid_capacity_limit_mw", 10.0))
-            return max(0.0, disp - lim)
-        return predict_step(step_idx)[0]
+            alloc_val = _get_alloc_for_step(step_idx)
+            return max(0.0, pred_raw - alloc_val)
+        return pred_raw
 
-    sur_pred = [_dispatched_surplus_for_step(i) if i >= T else None for i in window]
+    # Curba verde: Injecția REALĂ măsurată în rețea până la momentul T
+    inj_hist = [_dispatched_real_inj_for_step(i) if i <= T else None for i in window]
+    inj_raw_hist = [net_injection_mw(i) if i <= T else None for i in window]
 
-    t_x = row_T["dt"].to_pydatetime()
+    # Curba albastră punctată: Predicția Modelului AI (atât pe istoric T-24..T pentru comparație live, cât și pe viitor T..T+4)
+    ai_pred_full = [_dispatched_ai_pred_inj_for_step(i) for i in window]
+    inj_raw_fcst = [predict_step(i)[3] if i >= T else None for i in window]
+
+    t_x = dt_T
     live_value = actual_injection_T
-    prev_value = _dispatched_inj_for_step(T - 1) if T > 0 else live_value
+    prev_value = _dispatched_real_inj_for_step(T - 1)
     tick_delta = live_value - prev_value
     tick_color = "#00FF9D" if is_accepted else ("#00FF9D" if tick_delta >= 0 else "#FF4B4B")
     tick_arrow = "▲" if tick_delta >= 0 else "▼"
     if is_accepted:
         status_badge = '<span class="vc-badge-live" style="background:rgba(0,255,157,0.18);color:#00FF9D;border:1px solid rgba(0,255,157,0.5);">● SURPLUS ABSORBIT</span>'
     elif st.session_state.autoplay:
-        status_badge = '<span class="vc-badge-live">● LIVE</span>'
+        status_badge = '<span class="vc-badge-live">● LIVE RING BUFFER</span>'
     else:
         status_badge = '<span class="vc-badge-paused">❚❚ PAUSED</span>'
 
     st.markdown(
         f"""
 <div class="vc-ticker">
-  <div>{status_badge}<span class="vc-ticker-meta">PPC SOLAR INJECTION · NET MW</span></div>
+  <div>
+    {status_badge}
+    <span class="vc-ticker-meta">
+      <span style="color:#00FF9D;">━━ Real Măsurat</span> &nbsp;·&nbsp;
+      <span style="color:#38BDF8;">╌╌ Predicție Model AI (Out-of-Sample)</span>
+    </span>
+  </div>
   <div>
     <span class="vc-ticker-price" style="color:{tick_color};">{live_value:.2f} MW</span>
+    <span class="vc-ticker-meta" style="color:#38BDF8;margin-left:8px;">AI: {pred_inj_T:.2f} MW</span>
     <span class="vc-ticker-meta" style="color:{tick_color};margin-left:8px;">{tick_arrow} {abs(tick_delta):.2f} vs T-1h · {t_x.strftime('%d %b %H:%M')}</span>
   </div>
 </div>
@@ -514,8 +619,8 @@ with col_main:
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=xs, y=inj_hist, mode="lines", name="Injecție netă PPC",
-            line=dict(color="#00FF9D", width=2.8, shape="spline", smoothing=0.6),
+            x=xs, y=inj_hist, mode="lines", name="Injecție Reală Măsurată (≤ T)",
+            line=dict(color="#00FF9D", width=2.8, shape="spline", smoothing=0.5),
             fill="tozeroy", fillcolor="rgba(0,255,157,0.08)",
         )
     )
@@ -530,14 +635,14 @@ with col_main:
     if any_future_prebooked:
         fig.add_trace(
             go.Scatter(
-                x=xs, y=inj_raw_fcst, mode="lines", name="Prognoză brută (vârf nepreluat)",
+                x=xs, y=inj_raw_fcst, mode="lines", name="Prognoză AI brută (vârf nepreluat)",
                 line=dict(color="#F87171", width=1.5, dash="dot"),
             )
         )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=inj_fcst, mode="lines", name="Producție prognozată (T..T+4)",
-            line=dict(color="#38BDF8", width=2.2, dash="dash", shape="spline", smoothing=0.6),
+            x=xs, y=ai_pred_full, mode="lines", name="Predicție Model AI (Date Noi)",
+            line=dict(color="#38BDF8", width=2.3, dash="dash", shape="spline", smoothing=0.5),
         )
     )
     fig.add_trace(
@@ -546,10 +651,10 @@ with col_main:
             line=dict(color="#FF4B4B", width=2.5),
         )
     )
-    # Punctul "live" de la capătul curbei, ca ultimul preț pe un terminal de bursă
+    # Punctul "live" de la capătul curbei reale
     fig.add_trace(
         go.Scatter(
-            x=[t_x], y=[live_value], mode="markers", name="Tick curent",
+            x=[t_x], y=[live_value], mode="markers", name="Tick curent (Real)",
             marker=dict(size=13, color=tick_color, line=dict(color="#FFFFFF", width=2)),
             showlegend=False, hoverinfo="skip",
         )
@@ -562,7 +667,7 @@ with col_main:
     )
     fig.add_vrect(
         x0=t_x, x1=t_x + timedelta(hours=LOOKAHEAD_HOURS), fillcolor="rgba(142,149,165,0.08)", line_width=0,
-        annotation_text="PROGNOZĂ ML", annotation_position="top left",
+        annotation_text="PROGNOZĂ ML (DATE NOI)", annotation_position="top left",
         annotation_font=dict(color="#F59E0B", size=11),
     )
     fig.add_shape(
@@ -576,8 +681,8 @@ with col_main:
 
     # Anotații pe grafic pentru viitor (T+1..T+4)
     for f_i in future_idx:
-        f_dt = feed.iloc[f_i]["dt"].to_pydatetime()
-        s_f = predict_step(f_i)[0]
+        f_dt = _ring_dt(f_i)
+        s_f, _, _, pred_inj_f = predict_step(f_i)
         if st.session_state.accepted.get(f_i) == "ACCEPTED":
             fig.add_annotation(
                 x=f_dt, y=limit_line[window.index(f_i)],
@@ -588,7 +693,7 @@ with col_main:
             )
         elif s_f > agent.MIN_SURPLUS_THRESHOLD_MW:
             fig.add_annotation(
-                x=f_dt, y=net_injection_mw(feed.iloc[f_i]),
+                x=f_dt, y=pred_inj_f,
                 text=f"⚠️ VÂRF T+{f_i - T} ({s_f:.1f} MW)",
                 showarrow=True, arrowhead=2, arrowcolor="#FF4B4B",
                 font=dict(color="#FF7B7B", size=10),
@@ -675,7 +780,7 @@ with col_modal:
             f"""
 <div class="vc-modal">
   <div class="vc-modal-head">⚡ DISPECERAT PPC // CONTROL SURPLUS (ORA CURENTĂ)</div>
-  <div class="vc-modal-title">ACORD ARBITRAJ ENERGETIC · {row_T['dt'].strftime('%H:%M')}</div>
+  <div class="vc-modal-title">ACORD ARBITRAJ ENERGETIC · {dt_T.strftime('%H:%M')}</div>
   <div class="vc-modal-body">
     {status_card}
     <br>
@@ -722,10 +827,9 @@ with col_modal:
 
         # Posibilitate de pre-rezervare și pentru un vârf viitor
         if has_upcoming_spike:
-            spike_row = feed.iloc[first_spike_idx]
-            spike_dt = spike_row["dt"]
+            spike_dt = _ring_dt(first_spike_idx)
             lead_h = first_spike_idx - T
-            s_spike, c_spike, _ = predict_step(first_spike_idx)
+            s_spike, c_spike, _, _ = predict_step(first_spike_idx)
             allocs_spike = allocate(s_spike, c_spike)
             alloc_spike_mw = round(sum(a["allocated_mw"] for a in allocs_spike), 2)
             profit_spike = round(alloc_spike_mw * FIXED_PRICE_EUR, 2)
@@ -743,10 +847,9 @@ with col_modal:
 
     # CAZUL 2: La ora curentă T nu e surplus, DAR urmează un spike în lookahead (T+2)
     elif has_upcoming_spike:
-        spike_row = feed.iloc[first_spike_idx]
-        spike_dt = spike_row["dt"]
+        spike_dt = _ring_dt(first_spike_idx)
         lead_h = first_spike_idx - T
-        s_spike, c_spike, _ = predict_step(first_spike_idx)
+        s_spike, c_spike, _, _ = predict_step(first_spike_idx)
         allocs_spike = allocate(s_spike, c_spike)
         alloc_spike_mw = round(sum(a["allocated_mw"] for a in allocs_spike), 2)
         profit_spike = round(alloc_spike_mw * FIXED_PRICE_EUR, 2)
@@ -805,7 +908,7 @@ with col_modal:
   <div class="vc-modal-head">⚡ DISPECERAT PPC // REȚEA NOMINALĂ</div>
   <div class="vc-modal-title">FĂRĂ CONGESTIE PROGNOZATĂ</div>
   <div class="vc-modal-body">
-    Nici la ora {row_T['dt'].strftime('%H:%M')} și nici în următoarele {LOOKAHEAD_HOURS} ore nu se prognozează depășirea limitei liniei PPC de 10.0 MW. Sistemul funcționează în regim nominal standard.
+    Nici la ora {dt_T.strftime('%H:%M')} și nici în următoarele {LOOKAHEAD_HOURS} ore nu se prognozează depășirea limitei liniei PPC de 10.0 MW. Sistemul funcționează în regim nominal standard.
   </div>
 </div>
 """,
@@ -813,12 +916,9 @@ with col_modal:
         )
 
 # =====================================================================
-# AUTO-STEP
+# AUTO-STEP CONTINUU ÎN RING BUFFER (FĂRĂ OPRIRE LA FINALUL DATELOR)
 # =====================================================================
 if st.session_state.autoplay:
     time.sleep(AUTOPLAY_SECONDS)
-    if st.session_state.current_step < MAX_STEP:
-        st.session_state.pending_advance = True
-    else:
-        st.session_state.autoplay = False
+    st.session_state.pending_advance = True
     st.rerun()
