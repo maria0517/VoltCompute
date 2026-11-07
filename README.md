@@ -16,7 +16,7 @@ La orele prânzului (11:00–15:00), parcurile solare PPC produc frecvent mai mu
 
 ```text
 VoltCompute/
-├── schemas.py                 # [Rol 1: Архиtectură & Date] Contracte stricte Pydantic v2
+├── schemas.py                 # [Rol 1: Arhitectură & Date] Contracte stricte Pydantic v2
 ├── train.py                   # [Rol 2: Data Science / ML] Generator date + Baseline vs XGBRegressor
 ├── agent.py                   # [Rol 3: AI Agent Core] Ciclul perceive() -> estimate() -> decide() -> act()
 ├── simulator.py               # [Rol 4: Simulare & Business KPI] Motor 24h pe 3 scenarii + impact financiar/CO2
@@ -29,6 +29,8 @@ VoltCompute/
 ├── models/
 │   ├── model_surplus.pkl      # Modelul XGBRegressor antrenat
 │   └── metrics.json           # Comparația MAE / RMSE (DummyRegressor vs XGBRegressor)
+├── Dockerfile                 # Configurație container Docker
+├── .dockerignore              # Fișiere excluse din build-ul Docker
 └── requirements.txt
 ```
 
@@ -76,3 +78,27 @@ uvicorn server:app --reload --port 8000
 ```
 *(Documentația interactivă Swagger UI este disponibilă la `http://localhost:8000/docs`)*
 
+---
+
+## 🐳 Rulare cu Docker
+
+Proiectul include un `Dockerfile` gata configurat (cu Python 3.11, biblioteca `libgomp1` pentru XGBoost, antrenarea automată a modelului și expunerea porturilor `8501` și `8000`):
+
+```bash
+# 1. Construiește imaginea Docker
+docker build -t voltcompute .
+
+# 2. Pornește containerul cu dashboard-ul Streamlit (port 8501)
+docker run --rm -p 8501:8501 --name voltcompute-app voltcompute
+```
+
+După pornire, deschide în browser: **`http://localhost:8501`**
+
+*(Opțional) Comenzi suplimentare cu Docker:*
+```bash
+# Rulare server FastAPI pe portul 8000
+docker run --rm -p 8000:8000 voltcompute uvicorn server:app --host 0.0.0.0 --port 8000
+
+# Rulare teste unitare pytest în container
+docker run --rm voltcompute pytest -v
+```
