@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-11-07T20:51:52.626023",
+  "trained_at": "2026-11-07T23:57:57.436567",
   "model_type": "XGBRegressor",
   "train_dataset": "data\\train_energy_data.csv",
   "live_test_dataset": "data\\live_test_energy_data.csv",
