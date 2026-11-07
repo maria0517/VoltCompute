@@ -1,5 +1,6 @@
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -30,43 +31,31 @@ LOOKAHEAD_HOURS = 2
 HISTORY_HOURS = 24
 REFERENCE_TARIFF_EUR = VoltComputeSimulator.STANDARD_RETAIL_PRICE_EUR
 AUTOPLAY_SECONDS = 1.0
+DATACENTER_DATA_PATH = Path(__file__).parent / "data" / "3_data_centers.csv"
+THERMAL_SAFETY_MARGIN_C = 0.5
+TEMP_RISE_PER_MW_C = 0.5
 
 DATACENTERS: List[Dict[str, Any]] = [
     {
-        "id": "ROEDUNET-UPB-BUC",
-        "name": "RoEduNet - UPB AI Cluster (București)",
-        "short": "RoEduNet UPB",
-        "capacity_mw": 6.0,
-        "cooling_c": 20.5,
+        "id": "DC_AI_BUCURESTI",
+        "name": "AI Data Center București",
+        "short": "AI București",
         "queue": 45,
         "color": "#00FF9D",
     },
     {
-        "id": "UVT-HPC-TIM",
-        "name": "UVT HPC Center (Timișoara)",
-        "short": "UVT HPC",
-        "capacity_mw": 3.5,
-        "cooling_c": 22.0,
+        "id": "DC_CLOUD_CLUJ",
+        "name": "Cloud Data Center Cluj",
+        "short": "Cloud Cluj",
         "queue": 20,
         "color": "#38BDF8",
     },
     {
-        "id": "IFIN-HH-MAG",
-        "name": "IFIN-HH Nuclear Grid Node (Măgurele)",
-        "short": "IFIN-HH",
-        "capacity_mw": 5.0,
-        "cooling_c": 27.2,
+        "id": "DC_EDGE_TIMISOARA",
+        "name": "Edge Data Center Timișoara",
+        "short": "Edge Timișoara",
         "queue": 30,
         "color": "#FF4B4B",
-    },
-    {
-        "id": "UTCN-HPC-CLJ",
-        "name": "UTCN High-Performance Node (Cluj)",
-        "short": "UTCN HPC",
-        "capacity_mw": 2.5,
-        "cooling_c": 19.8,
-        "queue": 12,
-        "color": "#A78BFA",
     },
 ]
 
@@ -185,6 +174,16 @@ def load_feed() -> Tuple[pd.DataFrame, int, str]:
     return live_df, len(train_df), source
 
 
+@st.cache_data(show_spinner=False)
+def load_datacenter_feed() -> pd.DataFrame:
+    """Încarcă telemetria orară reală pentru capacitatea și temperatura fiecărui nod."""
+    datacenter_df = pd.read_csv(DATACENTER_DATA_PATH)
+    datacenter_df["dt"] = pd.to_datetime(datacenter_df["timestamp"])
+    if "hour" not in datacenter_df.columns:
+        datacenter_df["hour"] = datacenter_df["dt"].dt.hour
+    return datacenter_df
+
+
 def ensure_model(agent: VoltComputeAgent) -> str:
     """
     Asigură că modelul este antrenat EXCLUSIV pe setul de antrenare `train_energy_data.csv`
@@ -203,6 +202,12 @@ def ensure_model(agent: VoltComputeAgent) -> str:
 
 
 feed, N_TRAIN_ROWS, feed_source = load_feed()
+datacenter_feed = load_datacenter_feed()
+DATACENTER_LOOKUP = datacenter_feed.set_index(["dt", "dc_id"]).to_dict("index")
+DATACENTER_HOUR_LOOKUP = {
+    (int(row["hour"]), row["dc_id"]): row.to_dict()
+    for _, row in datacenter_feed.iterrows()
+}
 N_ROWS = len(feed)  # 288h (12 zile complete 00:00 -> 23:00 pentru Ring Buffer fără discontinuitate)
 BASE_LIVE_DT: datetime = feed.iloc[0]["dt"].to_pydatetime()
 # Scală verticală fixă pentru grafic, ca axa să nu "sară" la fiecare tick (ca pe un terminal de bursă)
@@ -341,9 +346,9 @@ def predict_step(v_idx: int) -> Tuple[float, float, Dict[str, float], float]:
 # =====================================================================
 # MOTORUL DE OFERTE PE DATA CENTRE (SECVENȚIAL, CU REFUZ -> URMĂTORUL NOD)
 # =====================================================================
-# Nodurile peste limita termică sunt excluse automat; restul sunt ordonate după coada de joburi.
+# Ordinea ofertării este stabilă, iar eligibilitatea se verifică dinamic pentru fiecare oră.
 ELIGIBLE_NODES: List[Dict[str, Any]] = sorted(
-    [n for n in DATACENTERS if n["cooling_c"] <= agent.THERMAL_LIMIT_CELSIUS],
+    DATACENTERS,
     key=lambda n: -n["queue"],
 )
 
@@ -378,6 +383,57 @@ def node_open_for_step(step: int, node: Dict[str, Any]) -> bool:
     )
 
 
+def datacenter_snapshot(step: int, node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Returnează telemetria CSV pentru nodul și ora din ring buffer."""
+    feed_row = _ring_row(step)
+    timestamp = pd.Timestamp(feed_row["dt"])
+    snapshot = DATACENTER_LOOKUP.get((timestamp, node["id"]))
+    if snapshot is None:
+        snapshot = DATACENTER_HOUR_LOOKUP.get((int(feed_row["hour"]), node["id"]))
+    return dict(snapshot) if snapshot is not None else None
+
+
+def delivered_to_node(step: int, node: Dict[str, Any]) -> float:
+    """MW livrați nodului la pasul respectiv, după acceptarea ofertei."""
+    return float(st.session_state.deals.get(step, {}).get(node["id"], 0.0))
+
+
+def delivered_temperature(step: int, node: Dict[str, Any]) -> Optional[float]:
+    """Temperatura actualizată după ce energia acceptată ajunge la nod."""
+    snapshot = datacenter_snapshot(step, node)
+    if snapshot is None:
+        return None
+    return float(snapshot["temp_servere_c"]) + delivered_to_node(step, node) * TEMP_RISE_PER_MW_C
+
+
+def thermal_rejected(step: int, node: Dict[str, Any]) -> bool:
+    """Blochează oferta la temperatura-limită sau în marja de siguranță."""
+    snapshot = datacenter_snapshot(step, node)
+    if snapshot is None:
+        return False
+    current_temp = float(snapshot["temp_servere_c"])
+    thermal_limit = float(snapshot["limita_termica_c"])
+    if delivered_to_node(step, node) > 0:
+        return delivered_temperature(step, node) > thermal_limit
+    return current_temp >= thermal_limit - THERMAL_SAFETY_MARGIN_C
+
+
+def offer_capacity(step: int, node: Dict[str, Any], remaining_mw: float) -> float:
+    """Calculează oferta maximă folosind capacitatea liberă și limita termică din CSV."""
+    snapshot = datacenter_snapshot(step, node)
+    if snapshot is None:
+        return 0.0
+
+    current_temp = float(snapshot["temp_servere_c"])
+    thermal_limit = float(snapshot["limita_termica_c"])
+    free_capacity = max(0.0, float(snapshot["capacitate_libera_mw"]))
+    if current_temp >= thermal_limit - THERMAL_SAFETY_MARGIN_C:
+        return 0.0
+
+    thermal_capacity = max(0.0, (thermal_limit - current_temp) / TEMP_RISE_PER_MW_C)
+    return max(0.0, min(float(remaining_mw), free_capacity, thermal_capacity))
+
+
 def build_offer(steps: List[int]) -> Tuple[Optional[Dict[str, Any]], bool]:
     """
     Alege oferta curentă: primul data center eligibil (după prioritate) care nu a răspuns încă.
@@ -391,7 +447,7 @@ def build_offer(steps: List[int]) -> Tuple[Optional[Dict[str, Any]], bool]:
         per_step: Dict[int, float] = {}
         for s in pending_steps:
             if node_open_for_step(s, node):
-                mw = round(min(remaining_surplus(s), float(node["capacity_mw"])), 2)
+                mw = round(offer_capacity(s, node, remaining_surplus(s)), 2)
                 if mw >= 0.05:
                     per_step[s] = mw
         if per_step:
@@ -803,10 +859,18 @@ with col_ppc:
 
     # ---------------- Tabel arbitraj (sincronizat cu ofertele și răspunsurile data centerelor) ----------------
     def _node_status(node: Dict[str, Any]) -> str:
-        if node["cooling_c"] > agent.THERMAL_LIMIT_CELSIUS:
-            return "REJECTED_THERMAL_SAFETY"
+        snapshots = [datacenter_snapshot(s, node) for s in table_steps]
+        if any(snapshot is None for snapshot in snapshots):
+            return "NO_TELEMETRY"
         if any(node["id"] in st.session_state.deals.get(s, {}) for s in table_steps):
+            if any(
+                delivered_temperature(s, node) > float(snapshot["limita_termica_c"])
+                for s, snapshot in zip(table_steps, snapshots)
+            ):
+                return "REJECTED_THERMAL_SAFETY"
             return "ACCEPTED"
+        if any(thermal_rejected(s, node) for s in table_steps):
+            return "REJECTED_THERMAL_SAFETY"
         if any(node["id"] in st.session_state.refused.get(s, set()) for s in table_steps):
             return "REFUSED"
         if offer is not None and offer["node"]["id"] == node["id"]:
@@ -819,15 +883,24 @@ with col_ppc:
 
     table_rows = []
     for node in DATACENTERS:
+        table_snapshot = datacenter_snapshot(table_steps[0], node)
         contracted = round(
             sum(st.session_state.deals.get(s, {}).get(node["id"], 0.0) for s in table_steps), 2
         )
         pending_mwh = offer["total_mwh"] if (offer is not None and offer["node"]["id"] == node["id"]) else 0.0
+        current_temp = delivered_temperature(table_steps[0], node)
+        if current_temp is None:
+            current_temp = float("nan")
+        free_capacity = (
+            max(0.0, float(table_snapshot["capacitate_libera_mw"]) - contracted)
+            if table_snapshot is not None
+            else 0.0
+        )
         table_rows.append(
             {
                 "Nod": node["name"],
-                "Temp Răcire (°C)": node["cooling_c"],
-                "Capacitate (MW)": node["capacity_mw"],
+                "Temp Servere (°C)": current_temp,
+                "Capacitate liberă (MW)": free_capacity,
                 "Status Agent": _node_status(node),
                 "MWh în Ofertă": pending_mwh,
                 "MWh Contractați": contracted,
@@ -852,14 +925,15 @@ with col_ppc:
             "REJECTED_THERMAL_SAFETY": "color:#FF4B4B;font-weight:600",
             "ESCALATE_TO_HUMAN": "color:#F59E0B;font-weight:600",
             "IN_QUEUE": "color:#38BDF8;font-weight:600",
+            "NO_TELEMETRY": "color:#8E95A5;font-weight:600",
         }
         return palette.get(value, "color:#8E95A5")
 
     st.dataframe(
         table.style.map(_status_color, subset=["Status Agent"]).format(
             {
-                "Temp Răcire (°C)": "{:.1f}",
-                "Capacitate (MW)": "{:.1f}",
+                "Temp Servere (°C)": "{:.1f}",
+                "Capacitate liberă (MW)": "{:.2f}",
                 "MWh în Ofertă": "{:.2f}",
                 "MWh Contractați": "{:.2f}",
                 "Profit PPC (€)": "{:,.2f}",
@@ -902,7 +976,9 @@ with col_dc:
         client_savings = total_mwh * savings_per_mwh
         full_price_cost = total_mwh * REFERENCE_TARIFF_EUR
         offer_cost = total_mwh * FIXED_PRICE_EUR
-        jobs_started = max(1, int(round(node["queue"] * avg_mw / node["capacity_mw"])))
+        first_snapshot = datacenter_snapshot(first_step, node)
+        capacity_basis = float(first_snapshot["capacitate_libera_mw"]) if first_snapshot else 0.0
+        jobs_started = max(1, int(round(node["queue"] * avg_mw / max(capacity_basis, 0.01))))
         queue_after = [n["short"] for n in ELIGIBLE_NODES if n["id"] != node["id"] and node_open_for_step(first_step, n)]
         queue_txt = " → ".join(queue_after) if queue_after else "niciun alt data center"
 
@@ -965,8 +1041,8 @@ with col_dc:
   <div class="vc-modal-head">🚫 NICIUN DATA CENTER DISPONIBIL</div>
   <div class="vc-modal-title">NU MAI SUNT ALTE DATA CENTERE DISPONIBILE</div>
   <div class="vc-modal-body">
-    Toate data centerele eligibile au răspuns, iar <span class="vc-mono" style="color:#FF7B7B;">{uncovered:.2f} MWh</span>
-    de surplus au rămas necontractați. IFIN-HH este exclus din motive de siguranță termică.
+    Toate data centerele disponibile au răspuns sau au fost excluse din motive de capacitate și siguranță termică,
+    iar <span class="vc-mono" style="color:#FF7B7B;">{uncovered:.2f} MWh</span> de surplus au rămas necontractați.
     <br><br>
     {deals_html}
   </div>
