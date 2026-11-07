@@ -1,24 +1,18 @@
+"""VOLTCOMPUTE // PPC GRID DISPATCH — SCADA Live Terminal & Intraday AI Agent Console."""
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import time
-from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.ensemble import HistGradientBoostingRegressor
 
 from agent import VoltComputeAgent
-from schemas import GridTelemetry
-from simulator import VoltComputeSimulator
-from train import (
-    DATA_PATH,
-    ENGINEERED_FEATURE_COLUMNS,
-    TARGET_COLUMN,
-    add_engineered_features,
-    generate_synthetic_dataset,
-)
+from schemas import AgentDecision, DispatchAction
+from simulator import VoltComputeSimulator, load_scenario_status
+from train_pipeline import load_hourly_history
 
 st.set_page_config(
     page_title="VOLTCOMPUTE // PPC GRID DISPATCH",
@@ -33,47 +27,39 @@ HISTORY_HOURS = 24
 REFERENCE_TARIFF_EUR = VoltComputeSimulator.STANDARD_RETAIL_PRICE_EUR
 AUTOPLAY_SECONDS = 1.0
 
-DATACENTERS: List[Dict[str, Any]] = [
-    {
-        "id": "ROEDUNET-UPB-BUC",
+NODE_META: Dict[str, Dict[str, Any]] = {
+    "DC_AI_BUCURESTI": {
         "name": "RoEduNet - UPB AI Cluster (București)",
         "short": "RoEduNet UPB",
-        "capacity_mw": 6.0,
-        "cooling_c": 20.5,
+        "daemon": "ROEDUNET UPB SLURM DAEMON",
         "queue": 45,
         "color": "#00FF9D",
     },
-    {
-        "id": "UVT-HPC-TIM",
+    "DC_CLOUD_CLUJ": {
+        "name": "UTCN High-Performance Node (Cluj)",
+        "short": "UTCN HPC Cluj",
+        "daemon": "UTCN CLUJ KUBERNETES DAEMON",
+        "queue": 28,
+        "color": "#A78BFA",
+    },
+    "DC_EDGE_TIMISOARA": {
         "name": "UVT HPC Center (Timișoara)",
-        "short": "UVT HPC",
-        "capacity_mw": 3.5,
-        "cooling_c": 22.0,
+        "short": "UVT HPC Timișoara",
+        "daemon": "UVT TIMIȘOARA SLURM DAEMON",
         "queue": 20,
         "color": "#38BDF8",
     },
-    {
-        "id": "IFIN-HH-MAG",
-        "name": "IFIN-HH Nuclear Grid Node (Măgurele)",
-        "short": "IFIN-HH",
-        "capacity_mw": 5.0,
-        "cooling_c": 27.2,
-        "queue": 30,
-        "color": "#FF4B4B",
-    },
-    {
-        "id": "UTCN-HPC-CLJ",
-        "name": "UTCN High-Performance Node (Cluj)",
-        "short": "UTCN HPC",
-        "capacity_mw": 2.5,
-        "cooling_c": 19.8,
-        "queue": 12,
-        "color": "#A78BFA",
-    },
-]
+}
+
+SCENARIOS: Dict[str, str] = {
+    "CRITICAL_SOLAR_SUNDAY": "☀️ Amiază Însorită (Vârf Solar)",
+    "DATACENTER_THERMAL_RISK": "🔥 Avarie Chiller (Risc Termic)",
+    "UNCERTAIN_WEATHER_SHOCK": "⛈️ Front Instabil (Confidență < 75%)",
+    "REAL_CSV": "📊 Prosumatori CSV (Scară Nativă)",
+}
 
 # =====================================================================
-# STYLE
+# STYLE (Exact SCADA Terminal Aesthetic from main/AI-urea)
 # =====================================================================
 st.markdown(
     """
@@ -83,7 +69,7 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
     background-color: #0c0d12 !important;
     color: #E5E7EB;
 }
-.block-container {padding-top: 1.2rem; padding-bottom: 1.5rem; max-width: 100%;}
+.block-container {padding-top: 1.1rem; padding-bottom: 1.5rem; max-width: 100%;}
 [data-testid="stMetricValue"], [data-testid="stMetricDelta"] {
     font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace !important;
 }
@@ -108,22 +94,30 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
     100% {box-shadow: 0 0 0 0 rgba(0,255,157,0);}
 }
 .vc-sub {font-family: ui-monospace, Menlo, monospace; font-size: 0.78rem; color: #8E95A5;}
+.vc-badge-pill {
+    display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.70rem;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    background: rgba(56,189,248,0.10); border: 1px solid rgba(56,189,248,0.30);
+    color: #38BDF8; margin-left: 6px;
+}
 .vc-alert {
     border-radius: 10px; padding: 10px 16px; margin: 8px 0 12px 0;
     font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; font-size: 0.85rem;
 }
 .vc-alert-red {background: rgba(255,75,75,0.12); border: 1px solid rgba(255,75,75,0.5); color: #FF7B7B;}
+.vc-alert-amber {background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.5); color: #FBBF24;}
 .vc-alert-green {background: rgba(0,255,157,0.07); border: 1px solid rgba(0,255,157,0.3); color: #00FF9D;}
 .vc-modal {
     background: #14161e; border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 14px; padding: 18px; box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+    border-radius: 14px; padding: 16px; margin-bottom: 10px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.55);
 }
 .vc-modal-head {
     font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
-    font-size: 0.78rem; color: #38BDF8; letter-spacing: 0.06em; margin-bottom: 10px;
+    font-size: 0.76rem; color: #38BDF8; letter-spacing: 0.06em; margin-bottom: 6px;
 }
-.vc-modal-title {font-size: 1.05rem; font-weight: 700; color: #FFFFFF; margin-bottom: 8px;}
-.vc-modal-body {font-size: 0.88rem; color: #D1D5DB; line-height: 1.5;}
+.vc-modal-title {font-size: 1.0rem; font-weight: 700; color: #FFFFFF; margin-bottom: 6px;}
+.vc-modal-body {font-size: 0.85rem; color: #D1D5DB; line-height: 1.45;}
 .vc-mono {font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;}
 .vc-ticker {
     display: flex; justify-content: space-between; align-items: baseline;
@@ -147,158 +141,135 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
     unsafe_allow_html=True,
 )
 
-# =====================================================================
-# DATA, MODEL & AGENT
-# =====================================================================
 
-
+# =====================================================================
+# DATA, MODEL & SESSION STATE
+# =====================================================================
 @st.cache_data(show_spinner=False)
-def load_feed() -> Tuple[pd.DataFrame, str]:
-    """Încarcă CSV-ul cronologic; dacă lipsește, generează 48h realiste la runtime."""
-    if Path(DATA_PATH).exists():
-        df = pd.read_csv(DATA_PATH)
-        source = str(DATA_PATH)
-    else:
-        df = generate_synthetic_dataset(n_hours=48)
-        source = "synthetic runtime feed (48h)"
-    df = df.reset_index(drop=True)
-    df["dt"] = pd.to_datetime(df["timestamp"])
-    if "gross_solar_mw" not in df.columns:
-        derating = 1.0 - np.maximum(0.0, (df["ambient_temp_celsius"] - 25.0) * 0.004)
-        df["gross_solar_mw"] = df["solar_irradiance_wm2"] / 1000.0 * 17.8 * derating
-    return df, source
+def read_history() -> pd.DataFrame:
+    return load_hourly_history()
 
 
-def ensure_model(agent: VoltComputeAgent, feed: pd.DataFrame) -> str:
-    """Folosește models/model_surplus.pkl; dacă lipsește, antrenează un HistGradientBoosting."""
-    if agent.model_artifact is not None and "model" in agent.model_artifact:
-        return "model_surplus.pkl"
-    if TARGET_COLUMN in feed.columns:
-        engineered = add_engineered_features(feed)
-        model = HistGradientBoostingRegressor(max_iter=200, max_depth=5, learning_rate=0.05, random_state=42)
-        model.fit(engineered[ENGINEERED_FEATURE_COLUMNS], engineered[TARGET_COLUMN])
-        agent.model_artifact = {"model": model, "feature_columns": ENGINEERED_FEATURE_COLUMNS}
-        return "HistGradientBoosting (runtime fallback)"
-    return "physics fallback"
+def demo_status(step: int) -> Dict[str, Any]:
+    """Explicit fail-closed synthetic fallback when CSV files are missing."""
+    ts = pd.Timestamp("2026-05-01") + pd.Timedelta(hours=step)
+    grid = dict(
+        timestamp=ts.isoformat(),
+        hour=ts.hour,
+        solar_irradiance_wm2=700.0,
+        ambient_temp_celsius=22.0,
+        day_ahead_price_eur=0.0,
+        grid_capacity_limit_mw=0.35,
+        prosumer_battery_soc_pct=85.0,
+        weather_stability_index=0.58,
+    )
+    centers = [
+        dict(
+            dc_id="DC_AI_BUCURESTI",
+            capacitate_libera_mw=6.0,
+            temp_servere_c=21.0,
+            limita_termica_c=26.0,
+            pret_contract_eur_mwh=110.0,
+        )
+    ]
+    return dict(
+        grid=grid,
+        base_grid=deepcopy(grid),
+        data_centers=centers,
+        confidence_override=None,
+        data_source="DEMO SYNTHETIC — CSV indisponibil",
+    )
 
 
-feed, feed_source = load_feed()
-N_ROWS = len(feed)
-MAX_STEP = max(0, N_ROWS - 1 - LOOKAHEAD_HOURS)
-# Scală verticală fixă pentru grafic, ca axa să nu "sară" la fiecare tick (ca pe un terminal de bursă)
-Y_AXIS_MAX = float(feed["gross_solar_mw"].max()) * 1.08 + 0.5
+for name, default in (
+    ("agent", None),
+    ("transactions", {}),
+    ("decision_index", {}),
+    ("operator_log", []),
+    ("scenario", "CRITICAL_SOLAR_SUNDAY"),
+    ("current_step", 35),
+    ("autoplay", False),
+    ("pending_advance", False),
+):
+    if name not in st.session_state:
+        st.session_state[name] = default
 
-if "agent" not in st.session_state:
+if st.session_state.agent is None:
     st.session_state.agent = VoltComputeAgent()
-    st.session_state.model_source = ensure_model(st.session_state.agent, feed)
-if "pred_cache" not in st.session_state:
-    st.session_state.pred_cache = {}
-if "autoplay" not in st.session_state:
-    st.session_state.autoplay = False
-if "pending_advance" not in st.session_state:
-    st.session_state.pending_advance = False
-if "accepted" not in st.session_state:
-    st.session_state.accepted = {}
-if "current_step" not in st.session_state:
-    candidates = feed[(feed["hour"] == 13) & (feed.get("surplus_mw", 0) > 4.0)] if "surplus_mw" in feed.columns else feed.iloc[0:0]
-    if len(candidates) > 0:
-        default_step = int(candidates.index[0])
-    else:
-        noon = feed[feed["hour"].isin([12, 13])]
-        default_step = int(noon.index[0]) if len(noon) > 0 else 0
-    st.session_state.current_step = int(min(default_step, MAX_STEP))
-
-# Avansarea automată trebuie aplicată înainte ca widgetul slider să fie creat
-if st.session_state.pending_advance:
-    st.session_state.pending_advance = False
-    st.session_state.current_step = int(min(MAX_STEP, st.session_state.current_step + 1))
-
 agent: VoltComputeAgent = st.session_state.agent
 
+MIN_STEP = 24
+MAX_STEP = 719
 
-def net_injection_mw(row: pd.Series) -> float:
-    local_load = 1.4 + 0.5 * float(np.sin(np.pi * int(row["hour"]) / 12.0))
-    return round(max(0.0, float(row["gross_solar_mw"]) - local_load), 3)
+if st.session_state.pending_advance:
+    st.session_state.pending_advance = False
+    st.session_state.current_step = int(min(MAX_STEP, int(st.session_state.current_step) + 1))
 
+try:
+    history = read_history()
+    real_data = True
+    feed_source = "data/1_macro + 2_micro (100 prosumatori) + 3_data_centers.csv"
+except (OSError, ValueError, KeyError):
+    real_data = False
+    feed_source = "synthetic fallback feed"
+    times = pd.date_range("2026-05-01", periods=720, freq="h")
+    history = pd.DataFrame(
+        {
+            "timestamp": times,
+            "hour": times.hour,
+            "radiatie_solara_wm2": np.maximum(0.0, 850.0 * np.sin((times.hour - 6) * np.pi / 13.0)),
+            "temp_c": 22.0 + 6.0 * np.sin((times.hour - 5) * np.pi / 15.0),
+            "pret_pzu_eur_mwh": np.full(720, 45.0),
+            "Surplus_National_MW": np.maximum(0.0, 0.4 * np.sin((times.hour - 6) * np.pi / 12.0)),
+            "avg_battery_soc_pct": np.full(720, 80.0),
+            "total_prosumer_load_mw": np.full(720, 0.12),
+        }
+    )
 
-def predict_step(idx: int) -> Tuple[float, float, Dict[str, float]]:
-    """Surplus prezis de model (agent.estimate) pentru rândul `idx` din CSV."""
-    cache = st.session_state.pred_cache
-    if idx not in cache:
-        row = feed.iloc[idx]
-        grid = GridTelemetry(
-            timestamp=str(row["timestamp"]),
-            hour=int(row["hour"]),
-            solar_irradiance_wm2=float(row["solar_irradiance_wm2"]),
-            ambient_temp_celsius=float(row["ambient_temp_celsius"]),
-            day_ahead_price_eur=float(row["day_ahead_price_eur"]),
-            grid_capacity_limit_mw=float(row.get("grid_capacity_limit_mw", 10.0)),
-            is_weekend=int(row["dt"].day_of_week >= 5),
-        )
-        cache[idx] = agent.estimate(grid)
-    return cache[idx]
-
-
-def allocate(surplus: float, confidence: float) -> List[Dict[str, Any]]:
-    """
-    Împarte surplusul între nodurile valide, proporțional cu coada de joburi
-    (nodul cu coada cea mai mare primește cel mai mult), respectând capacitatea fiecărui nod.
-    Nodurile peste limita termică sunt respinse automat.
-    """
-    results = []
-    for node in DATACENTERS:
-        results.append({**node, "allocated_mw": 0.0, "status": "STANDBY", "jobs": 0})
-
-    valid = [r for r in results if r["cooling_c"] <= agent.THERMAL_LIMIT_CELSIUS]
-    for r in results:
-        if r["cooling_c"] > agent.THERMAL_LIMIT_CELSIUS:
-            r["status"] = "REJECTED_THERMAL_SAFETY"
-
-    if surplus > agent.MIN_SURPLUS_THRESHOLD_MW and confidence < agent.CONFIDENCE_THRESHOLD:
-        for r in valid:
-            r["status"] = "ESCALATE_TO_HUMAN"
-        return results
-
-    if surplus > agent.MIN_SURPLUS_THRESHOLD_MW:
-        remaining = min(surplus, sum(r["capacity_mw"] for r in valid))
-        active = list(valid)
-        for _ in range(8):
-            active = [r for r in active if r["allocated_mw"] < r["capacity_mw"] - 1e-9]
-            if remaining < 0.005 or not active:
-                break
-            weight_sum = sum(r["queue"] for r in active)
-            given = 0.0
-            for r in active:
-                share = remaining * r["queue"] / weight_sum
-                grant = min(share, r["capacity_mw"] - r["allocated_mw"])
-                r["allocated_mw"] += grant
-                given += grant
-            remaining -= given
-        for r in valid:
-            r["allocated_mw"] = round(r["allocated_mw"], 2)
-            if r["allocated_mw"] > 0:
-                r["status"] = "OFFER_GENERATED"
-                r["jobs"] = max(1, int(round(r["queue"] * r["allocated_mw"] / r["capacity_mw"])))
-    return results
+model_source = "XGBoost t+2h (model.joblib + TreeSHAP)" if agent.model_artifact is not None else "Fallback fizic"
 
 
 # =====================================================================
-# HEADER + TIMELINE CONTROL BAR
+# HEADER + SCENARIO BAR + TIMELINE CONTROLS
 # =====================================================================
 st.markdown(
     f"""
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-  <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH</div>
-  <div class="vc-sub">FEED: {feed_source} · MODEL: {st.session_state.model_source} · {N_ROWS}h</div>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;">
+  <div class="vc-title">
+    <span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH
+    <span class="vc-badge-pill">INTRADAY t+2h</span>
+    <span class="vc-badge-pill">EU AI ACT · HITL</span>
+    <span class="vc-badge-pill">PII &amp; PROMPT GUARD</span>
+  </div>
+  <div class="vc-sub">FEED: {feed_source} · MODEL: {model_source} · 720h</div>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
 
+def select_scenario(name: str) -> None:
+    st.session_state.autoplay = False
+    st.session_state.scenario = name
+    st.session_state.current_step = 35
+
+
+sc_cols = st.columns(4, gap="small")
+for col, (sc_name, sc_label) in zip(sc_cols, SCENARIOS.items()):
+    is_active = st.session_state.scenario == sc_name
+    col.button(
+        f"● {sc_label}" if is_active else sc_label,
+        key=f"scenario_{sc_name}",
+        on_click=select_scenario,
+        args=(sc_name,),
+        type="primary" if is_active else "secondary",
+        width="stretch",
+    )
+
+
 def _step_back() -> None:
     st.session_state.autoplay = False
-    st.session_state.current_step = max(0, int(st.session_state.current_step) - 1)
+    st.session_state.current_step = max(MIN_STEP, int(st.session_state.current_step) - 1)
 
 
 def _step_forward() -> None:
@@ -311,10 +282,11 @@ def _toggle_play() -> None:
 
 
 bar_back, bar_fwd, bar_play, bar_slider = st.columns([1, 1, 1.7, 5], gap="small")
-bar_back.button("◀ Pas Înapoi", on_click=_step_back, width="stretch")
-bar_fwd.button("▶ Pas Înainte", on_click=_step_forward, width="stretch")
+bar_back.button("◀ Pas Înapoi", key="nav_step_back", on_click=_step_back, width="stretch")
+bar_fwd.button("▶ Pas Înainte", key="nav_step_fwd", on_click=_step_forward, width="stretch")
 bar_play.button(
     "⏹ Stop Live Feed" if st.session_state.autoplay else "▶▶ Play Live Feed (Auto-step 1s)",
+    key="nav_toggle_play",
     on_click=_toggle_play,
     type="primary",
     width="stretch",
@@ -322,78 +294,250 @@ bar_play.button(
 with bar_slider:
     st.select_slider(
         "Timeline",
-        options=list(range(MAX_STEP + 1)),
+        options=list(range(MIN_STEP, MAX_STEP + 1)),
         key="current_step",
-        format_func=lambda i: feed.iloc[i]["dt"].strftime("%Y-%m-%d %H:%M"),
+        format_func=lambda i: pd.Timestamp(history.iloc[i]["timestamp"]).strftime("%Y-%m-%d %H:%M"),
         label_visibility="collapsed",
     )
 
-# =====================================================================
-# STATE AT STEP T + LOOKAHEAD T+1..T+4
-# =====================================================================
-T = int(st.session_state.current_step)
-row_T = feed.iloc[T]
-surplus_T, conf_T, shap_T = predict_step(T)
-allocs_T = allocate(surplus_T, conf_T)
-total_alloc_T = round(sum(a["allocated_mw"] for a in allocs_T), 2)
-revenue_T = round(total_alloc_T * FIXED_PRICE_EUR, 2)
 
-future_idx = [i for i in range(T + 1, min(N_ROWS, T + 1 + LOOKAHEAD_HOURS))]
-future_surplus = {i: predict_step(i)[0] for i in future_idx}
-peak_candidates = [(T, surplus_T)] + [(i, s) for i, s in future_surplus.items()]
-peak_idx, peak_mw = max(peak_candidates, key=lambda x: x[1])
+# =====================================================================
+# TRANSACTIONAL STATE AT STEP T
+# =====================================================================
+step = int(st.session_state.current_step)
+scenario = str(st.session_state.scenario)
 
-if peak_mw > 0.05:
+if real_data:
+    status = load_scenario_status(scenario, step)
+else:
+    status = demo_status(step)
+
+grid = status["base_grid"]
+centers = status["data_centers"]
+tx_key = (scenario, step, status["data_source"])
+
+if tx_key not in st.session_state.transactions:
+    decision = agent.run_cycle(
+        status["grid"],
+        data_centers=centers,
+        confidence_override=status["confidence_override"],
+    )
+    st.session_state.transactions[tx_key] = dict(
+        decision=decision,
+        forecast=decision.model_copy(deep=True),
+        injection=decision.demo_injected_surplus_mw,
+        result=None,
+        grid=deepcopy(status["grid"]),
+        centers=deepcopy(centers),
+    )
+    st.session_state.decision_index[decision.decision_id] = tx_key
+
+tx = st.session_state.transactions[tx_key]
+decision: AgentDecision = tx["decision"]
+forecast: AgentDecision = tx["forecast"]
+
+executed_reduction = round(decision.executed_absorbed_mw + decision.executed_curtailment_mw, 3)
+remaining_excess = (
+    float(tx["result"]["remaining_grid_excess_mw"])
+    if tx["result"] is not None
+    else float(decision.grid_excess_mw)
+)
+saved_curtailment = min(
+    max(0.0, decision.grid_excess_mw - decision.executed_curtailment_mw),
+    decision.executed_absorbed_mw,
+)
+
+
+def transact(
+    key: Tuple[str, int, str],
+    decision_id: str,
+    center_id: str,
+    action: str,
+    fallback_revision: int | None = None,
+) -> None:
+    """Executes an operator HITL action (Approve / Dutch Auction / Reject / Approve Fallback)."""
+    record = st.session_state.transactions[key]
+    if st.session_state.decision_index.get(decision_id) != key:
+        return
+    try:
+        result = st.session_state.agent.act(
+            record["decision"],
+            dispatch_action=DispatchAction(
+                decision_id=decision_id,
+                center_id=center_id,
+                action=action,  # type: ignore[arg-type]
+                fallback_revision=fallback_revision,
+            ),
+        )
+    except ValueError:
+        st.session_state.action_error = (
+            "Acțiune blocată de controalele de siguranță (verificați oferta activă și temperatura serverelor)."
+        )
+        return
+    record["decision"] = AgentDecision.model_validate(result["decision"])
+    record["result"] = result
+    st.session_state.operator_log.append(
+        dict(
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            scenario=key[0],
+            step=key[1],
+            decision_id=decision_id,
+            center_id=center_id,
+            action=action,
+            effective_mw=result["effective_mw"],
+            executed_mw=result["executed_mw"],
+            fallback_revision=fallback_revision,
+            effective_absorbed_mw=result["effective_absorbed_mw"],
+            effective_curtailment_mw=result["effective_curtailment_mw"],
+            executed_absorbed_mw=result["executed_absorbed_mw"],
+            remaining_grid_excess_mw=result["remaining_grid_excess_mw"],
+            execution_state=result["execution_state"],
+            webhook_sent=result["webhook_sent"],
+        )
+    )
+
+
+# =====================================================================
+# SERIES HELPERS FOR SCADA LIVE CHART
+# =====================================================================
+is_park_scale = scenario != "REAL_CSV"
+visual_limit_mw = 10.0 if is_park_scale else float(grid.get("grid_capacity_limit_mw", 0.35))
+
+
+def step_net_injection_mw(idx: int) -> float:
+    """Computes net grid injection at step `idx` on the active scenario scale."""
+    row = history.iloc[idx]
+    if not is_park_scale:
+        return round(float(row["Surplus_National_MW"]), 3)
+    irr = float(row["radiatie_solara_wm2"])
+    temp = float(row["temp_c"])
+    h = int(row["hour"])
+    derating = 1.0 - max(0.0, (temp - 25.0) * 0.004)
+    gross = (irr / 1000.0) * 17.8 * derating
+    local_load = 1.4 + 0.5 * float(np.sin(np.pi * h / 12.0))
+    base_net = max(0.0, gross - local_load)
+    # În fereastra solară 09..16 aliniem vârful cu surplusul scenariului (+8 MW + export CSV)
+    if 9 <= h <= 16 and irr > 200:
+        return round(max(base_net, 10.0 + float(row["Surplus_National_MW"]) + 8.0 * (irr / 850.0)), 3)
+    return round(base_net, 3)
+
+
+# =====================================================================
+# ALERT BANNER
+# =====================================================================
+now_dt = pd.Timestamp(grid["timestamp"]).to_pydatetime()
+target_dt = now_dt + timedelta(hours=2)
+active_pzu_eur = float(tx["grid"].get("demo_market_price_eur_mwh") or grid["day_ahead_price_eur"])
+
+if decision.status == "ESCALATE_TO_HUMAN":
     alert_html = (
-        f'<div class="vc-alert vc-alert-red">⚠️ ALERTĂ CURTAILMENT: Vârf de surplus de {peak_mw:.1f} MW '
-        f'detectat în următoarele ore (la {feed.iloc[peak_idx]["dt"].strftime("%H:%M")}, peste limita liniei de '
-        f'{float(row_T.get("grid_capacity_limit_mw", 10.0)):.0f} MW)</div>'
+        f'<div class="vc-alert vc-alert-amber">⚠️ STATUS: UNCERTAIN — Preluat de Operator Uman · '
+        f'Confidența modelului ({decision.confidence_score:.0%}) este sub pragul de siguranță (75%) pe fond de '
+        f'instabilitate atmosferică. Dispecerizarea automată este blocată (0.00 MW).</div>'
+    )
+elif decision.status == "DATA_ERROR":
+    alert_html = (
+        '<div class="vc-alert vc-alert-red">🛑 DATA_ERROR: Telemetrie coruptă sau model indisponibil — '
+        'alocare automată blocată în mod fail-closed (0.00 MW).</div>'
+    )
+elif executed_reduction > 0 and remaining_excess <= 1e-6:
+    alert_html = (
+        f'<div class="vc-alert vc-alert-green">✅ REȚEA SALVATĂ ÎN SIMULARE: {decision.executed_absorbed_mw:.2f} MW '
+        f'absorbiți (Data Centers + EV/BESS) pentru fereastra t+2h ({target_dt.strftime("%H:%M")}) — '
+        f'excesul peste limita liniei a fost eliminat complet!</div>'
+    )
+elif decision.surplus_predicted_mw > 0.05:
+    alert_html = (
+        f'<div class="vc-alert vc-alert-red">⚠️ ALERTĂ CURTAILMENT (t+2h → {target_dt.strftime("%H:%M")}): '
+        f'Surplus prognozat de {decision.surplus_predicted_mw:.2f} MW (Baterii prosumatori la '
+        f'{float(grid["prosumer_battery_soc_pct"]):.1f}% SoC · PZU {active_pzu_eur:.1f} €/MWh)</div>'
     )
 else:
     alert_html = (
-        f'<div class="vc-alert vc-alert-green">● GRID NOMINAL: nicio depășire a limitei liniei prognozată '
-        f'în următoarele {LOOKAHEAD_HOURS} ore</div>'
+        f'<div class="vc-alert vc-alert-green">● GRID NOMINAL: Nicio depășire critică a limitei liniei '
+        f'prognozată în următoarele {LOOKAHEAD_HOURS} ore.</div>'
     )
 
 col_main, col_modal = st.columns([0.72, 0.28], gap="large")
 
 # =====================================================================
-# MAIN COLUMN
+# MAIN COLUMN (SCADA CHART + ARBITRAGE TABLE + XAI/FALLBACK)
 # =====================================================================
 with col_main:
     st.markdown(alert_html, unsafe_allow_html=True)
 
+    accepted_offers = [o for o in decision.dc_offers if o.status == "ACCEPTED"]
+    planned_revenue_eur = sum(o.offered_mw * o.offered_price_eur for o in decision.dc_offers if o.offered_mw > 0)
+    executed_revenue_eur = sum(o.offered_mw * o.offered_price_eur for o in accepted_offers)
+    displayed_revenue = executed_revenue_eur if executed_revenue_eur > 0 else planned_revenue_eur
+    revenue_label = "executat" if executed_revenue_eur > 0 else "planificat Flash Deal"
+
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Iradiere Curentă", f"{float(row_T['solar_irradiance_wm2']):.0f} W/m²", f"{row_T['dt'].strftime('%H:%M')} · {float(row_T['ambient_temp_celsius']):.1f}°C")
+    m1.metric(
+        "Iradiere & Vreme (t)",
+        f"{float(grid['solar_irradiance_wm2']):.0f} W/m²",
+        f"{now_dt.strftime('%H:%M')} · {float(grid['ambient_temp_celsius']):.1f}°C · SoC {float(grid['prosumer_battery_soc_pct']):.0f}%",
+    )
     m2.metric(
         "Capacitate Rețea",
-        f"{float(row_T.get('grid_capacity_limit_mw', 10.0)):.0f} MW",
-        f"injecție {net_injection_mw(row_T):.1f} MW",
+        f"{visual_limit_mw:.2f} MW" if not is_park_scale else f"{visual_limit_mw:.0f} MW",
+        f"exces rămas {remaining_excess:.2f} MW",
         delta_color="inverse",
     )
-    m3.metric("Total Surplus Alocat", f"{total_alloc_T:.2f} MW", f"din {surplus_T:.2f} MW prezis")
-    m4.metric("Venit PPC Ora Curentă", f"{revenue_T:,.2f} €", f"PZU {float(row_T['day_ahead_price_eur']):.1f} €/MWh", delta_color="off")
+    m3.metric(
+        "Surplus Alocat (t+2h)",
+        f"{decision.allocated_mw:.2f} MW",
+        f"executat {decision.executed_absorbed_mw:.2f} MW · conf {decision.confidence_score:.0%}",
+    )
+    m4.metric(
+        f"Venit PPC ({revenue_label})",
+        f"{displayed_revenue:,.2f} €",
+        f"PZU {active_pzu_eur:.1f} €/MWh",
+        delta_color="off",
+    )
 
     # ---------------- Live ticker chart ----------------
-    start_i = max(0, T - HISTORY_HOURS)
-    end_i = min(N_ROWS - 1, T + LOOKAHEAD_HOURS)
+    start_i = max(MIN_STEP, step - HISTORY_HOURS)
+    end_i = min(MAX_STEP, step + LOOKAHEAD_HOURS)
     window = list(range(start_i, end_i + 1))
-    xs = [feed.iloc[i]["dt"].to_pydatetime() for i in window]
-    limit_line = [float(feed.iloc[i].get("grid_capacity_limit_mw", 10.0)) for i in window]
+    xs = [pd.Timestamp(history.iloc[i]["timestamp"]).to_pydatetime() for i in window]
+    limit_line = [visual_limit_mw for _ in window]
 
-    inj_hist = [net_injection_mw(feed.iloc[i]) if i <= T else None for i in window]
-    inj_fcst = [net_injection_mw(feed.iloc[i]) if i >= T else None for i in window]
-    sur_pred = [predict_step(i)[0] if i >= T else None for i in window]
+    inj_hist = [step_net_injection_mw(i) if i <= step else None for i in window]
+    inj_fcst = [step_net_injection_mw(i) if i >= step else None for i in window]
 
-    node_bars: Dict[str, List[float]] = {n["id"]: [] for n in DATACENTERS}
+    # Curba de surplus prezis de model pe fereastra t..t+4
+    fc_map: Dict[int, float] = {0: float(decision.surplus_predicted_mw)}
+    for pt in forecast.forecast_window:
+        fc_map[pt.prediction_horizon_hours] = round(
+            float(pt.predicted_export_mw) + (float(tx["injection"]) if is_park_scale else 0.0), 3
+        )
+    sur_pred = [fc_map.get(i - step) if i >= step else None for i in window]
+
+    # Curba după Arbitraj (când operatorul aprobă oferte DC sau Fallback)
+    inj_after_arb = [
+        max(0.0, (step_net_injection_mw(i) - executed_reduction))
+        if (i >= step and executed_reduction > 0)
+        else None
+        for i in window
+    ]
+
+    # Bare stivuite pe noduri Data Center
+    node_bars: Dict[str, List[float]] = {dc_id: [] for dc_id in NODE_META}
+    offer_by_id = {o.dc_id: o for o in decision.dc_offers}
     for i in window:
-        s_i, c_i, _ = predict_step(i)
-        for a in allocate(s_i, c_i):
-            node_bars[a["id"]].append(a["allocated_mw"])
+        for dc_id in NODE_META:
+            if i == step and dc_id in offer_by_id:
+                node_bars[dc_id].append(round(float(offer_by_id[dc_id].offered_mw), 3))
+            elif i > step and dc_id in offer_by_id and decision.allocated_mw > 0:
+                share = float(offer_by_id[dc_id].offered_mw) / max(decision.allocated_mw, 1e-6)
+                s_h = fc_map.get(i - step, 0.0)
+                node_bars[dc_id].append(round(s_h * share, 3))
+            else:
+                node_bars[dc_id].append(0.0)
 
-    t_x = row_T["dt"].to_pydatetime()
-    live_value = net_injection_mw(row_T)
-    prev_value = net_injection_mw(feed.iloc[T - 1]) if T > 0 else live_value
+    live_value = step_net_injection_mw(step)
+    prev_value = step_net_injection_mw(step - 1) if step > MIN_STEP else live_value
     tick_delta = live_value - prev_value
     tick_color = "#00FF9D" if tick_delta >= 0 else "#FF4B4B"
     tick_arrow = "▲" if tick_delta >= 0 else "▼"
@@ -405,202 +549,433 @@ with col_main:
     st.markdown(
         f"""
 <div class="vc-ticker">
-  <div>{status_badge}<span class="vc-ticker-meta">PPC SOLAR INJECTION · NET MW</span></div>
+  <div>{status_badge}<span class="vc-ticker-meta">PPC SOLAR INJECTION · NET MW ({SCENARIOS[scenario]})</span></div>
   <div>
     <span class="vc-ticker-price" style="color:{tick_color};">{live_value:.2f} MW</span>
-    <span class="vc-ticker-meta" style="color:{tick_color};margin-left:8px;">{tick_arrow} {abs(tick_delta):.2f} vs T-1h · {t_x.strftime('%d %b %H:%M')}</span>
+    <span class="vc-ticker-meta" style="color:{tick_color};margin-left:8px;">{tick_arrow} {abs(tick_delta):.2f} vs T-1h · {now_dt.strftime('%d %b %H:%M')}</span>
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
+    y_axis_max = max(max(step_net_injection_mw(i) for i in window), visual_limit_mw) * 1.18 + 0.25
+
     fig = go.Figure()
-    for node in DATACENTERS:
+    for dc_id, meta in NODE_META.items():
         fig.add_trace(
             go.Bar(
                 x=xs,
-                y=node_bars[node["id"]],
-                name=f"Absorbit: {node['short']}",
-                marker_color=node["color"],
-                opacity=0.8,
+                y=node_bars[dc_id],
+                name=f"Alocat: {meta['short']}",
+                marker_color=meta["color"],
+                opacity=0.82,
             )
         )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=inj_hist, mode="lines", name="Producție solară netă (istoric ≤ T)",
+            x=xs,
+            y=inj_hist,
+            mode="lines",
+            name="Producție solară netă (istoric ≤ T)",
             line=dict(color="#00FF9D", width=2.5, shape="spline", smoothing=0.6),
-            fill="tozeroy", fillcolor="rgba(0,255,157,0.07)",
+            fill="tozeroy",
+            fillcolor="rgba(0,255,157,0.07)",
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=inj_fcst, mode="lines", name="Producție prognozată (CSV T..T+4)",
+            x=xs,
+            y=inj_fcst,
+            mode="lines",
+            name="Injecție prognozată fără arbitraj (T..T+4)",
             line=dict(color="#38BDF8", width=2, dash="dash", shape="spline", smoothing=0.6),
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=sur_pred, mode="lines+markers", name="Surplus prezis de model",
-            line=dict(color="#F59E0B", width=2, dash="dot"), marker=dict(size=6),
+            x=xs,
+            y=sur_pred,
+            mode="lines+markers",
+            name="Surplus prezis de model XGBoost (t+1..t+4)",
+            line=dict(color="#F59E0B", width=2, dash="dot"),
+            marker=dict(size=6),
         )
     )
+    if executed_reduction > 0:
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=inj_after_arb,
+                mode="lines+markers",
+                name="Injecție netă după Arbitraj (Rețea Salvată)",
+                line=dict(color="#10B981", width=3),
+                marker=dict(size=8, color="#00FF9D", symbol="diamond"),
+            )
+        )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=limit_line, mode="lines", name="Limită linie PPC",
+            x=xs,
+            y=limit_line,
+            mode="lines",
+            name="Limită linie PPC",
             line=dict(color="#FF4B4B", width=2),
         )
     )
-    # Punctul "live" de la capătul curbei, ca ultimul preț pe un terminal de bursă
     fig.add_trace(
         go.Scatter(
-            x=[t_x], y=[live_value], mode="markers", name="Tick curent",
+            x=[now_dt],
+            y=[live_value],
+            mode="markers",
+            name="Tick curent",
             marker=dict(size=13, color=tick_color, line=dict(color="#FFFFFF", width=2)),
-            showlegend=False, hoverinfo="skip",
+            showlegend=False,
+            hoverinfo="skip",
         )
     )
     fig.add_hline(
-        y=live_value, line_width=1, line_dash="dot", line_color=tick_color, opacity=0.6,
-        annotation_text=f" {live_value:.2f} MW ", annotation_position="right",
+        y=live_value,
+        line_width=1,
+        line_dash="dot",
+        line_color=tick_color,
+        opacity=0.6,
+        annotation_text=f" {live_value:.2f} MW ",
+        annotation_position="right",
         annotation_font=dict(color="#0c0d12", size=11),
         annotation_bgcolor=tick_color,
     )
     fig.add_vrect(
-        x0=t_x, x1=t_x + timedelta(hours=LOOKAHEAD_HOURS), fillcolor="rgba(142,149,165,0.12)", line_width=0,
-        annotation_text="PROGNOZĂ ML", annotation_position="top left",
+        x0=now_dt,
+        x1=now_dt + timedelta(hours=LOOKAHEAD_HOURS),
+        fillcolor="rgba(142,149,165,0.12)",
+        line_width=0,
+        annotation_text="PROGNOZĂ ML (t+1..t+4h)",
+        annotation_position="top left",
         annotation_font=dict(color="#F59E0B", size=11),
     )
     fig.add_shape(
-        type="line", x0=t_x, x1=t_x, y0=0, y1=1, yref="paper",
+        type="line",
+        x0=now_dt,
+        x1=now_dt,
+        y0=0,
+        y1=1,
+        yref="paper",
         line=dict(color="#FF4B4B", width=2, dash="dot"),
     )
     fig.add_annotation(
-        x=t_x, y=1, yref="paper", text=f"T = {t_x.strftime('%H:%M')}", showarrow=False,
-        yanchor="bottom", font=dict(color="#FF7B7B", size=11),
+        x=now_dt,
+        y=1,
+        yref="paper",
+        text=f"T = {now_dt.strftime('%H:%M')}",
+        showarrow=False,
+        yanchor="bottom",
+        font=dict(color="#FF7B7B", size=11),
     )
     fig.update_layout(
         barmode="stack",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="JetBrains Mono, monospace", color="#8E95A5", size=11),
-        height=430,
+        height=420,
         margin=dict(l=10, r=60, t=40, b=10),
         hovermode="x unified",
         uirevision="voltcompute-live",
         xaxis=dict(
             gridcolor="rgba(255,255,255,0.05)",
-            range=[t_x - timedelta(hours=HISTORY_HOURS), t_x + timedelta(hours=LOOKAHEAD_HOURS)],
-            showspikes=True, spikecolor="rgba(255,255,255,0.35)", spikethickness=1, spikedash="dot",
+            range=[now_dt - timedelta(hours=HISTORY_HOURS), now_dt + timedelta(hours=LOOKAHEAD_HOURS)],
+            showspikes=True,
+            spikecolor="rgba(255,255,255,0.35)",
+            spikethickness=1,
+            spikedash="dot",
         ),
         yaxis=dict(
-            title="MW", side="right", range=[0, Y_AXIS_MAX],
-            gridcolor="rgba(255,255,255,0.05)", zerolinecolor="rgba(255,255,255,0.1)",
-            showspikes=True, spikecolor="rgba(255,255,255,0.35)", spikethickness=1, spikedash="dot",
+            title="MW",
+            side="right",
+            range=[0, y_axis_max],
+            gridcolor="rgba(255,255,255,0.05)",
+            zerolinecolor="rgba(255,255,255,0.1)",
+            showspikes=True,
+            spikecolor="rgba(255,255,255,0.35)",
+            spikethickness=1,
+            spikedash="dot",
         ),
         legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0, font=dict(size=10)),
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", key="scada_live_chart")
 
     # ---------------- Arbitrage table ----------------
-    st.markdown('<div class="vc-sub" style="margin:4px 0;">ARBITRAJ MULTI-NOD · ORA T</div>', unsafe_allow_html=True)
-    table = pd.DataFrame(
-        [
-            {
-                "Nod": a["name"],
-                "Temp Răcire (°C)": a["cooling_c"],
-                "Capacitate (MW)": a["capacity_mw"],
-                "Status Agent": a["status"],
-                "Ofertă (MW)": a["allocated_mw"],
-                "Preț Fix (€/MWh)": FIXED_PRICE_EUR if a["allocated_mw"] > 0 else 0.0,
-                "Joburi Deblocate": f"{a['jobs']}/{a['queue']}",
-            }
-            for a in allocs_T
-        ]
+    st.markdown(
+        '<div class="vc-sub" style="margin:4px 0;">ARBITRAJ MULTI-NOD · DECIZIE AGENT LA ORA T → LIVRARE T+2H</div>',
+        unsafe_allow_html=True,
     )
+    table_rows = []
+    for offer in decision.dc_offers:
+        meta = NODE_META.get(
+            offer.dc_id,
+            {"name": offer.dc_name, "queue": 20},
+        )
+        q_total = int(meta["queue"])
+        jobs_unlocked = (
+            max(1, int(round(q_total * offer.offered_mw / max(offer.available_capacity_mw, 0.1))))
+            if offer.offered_mw > 0
+            else 0
+        )
+        table_rows.append(
+            {
+                "Nod": f"{meta['name']} [{offer.dc_id}]",
+                "Temp Răcire (°C)": offer.current_temp_c,
+                "Cutoff (°C)": offer.thermal_limit_c - 1.5,
+                "Capacitate (MW)": offer.available_capacity_mw,
+                "Status Agent": offer.status,
+                "Ofertă (MW)": offer.offered_mw,
+                "Preț Ofertă (€/MWh)": offer.offered_price_eur if offer.offered_mw > 0 or offer.status == "REJECTED_BY_OPERATOR" else 0.0,
+                "Contract (€/MWh)": offer.contract_price_eur,
+                "Joburi Deblocate": f"{jobs_unlocked}/{q_total}",
+            }
+        )
+    table_df = pd.DataFrame(table_rows)
 
     def _status_color(value: str) -> str:
         palette = {
             "OFFER_GENERATED": "color:#00FF9D;font-weight:600",
+            "ACCEPTED": "color:#10B981;font-weight:700",
             "REJECTED_THERMAL_SAFETY": "color:#FF4B4B;font-weight:600",
+            "REJECTED_BY_OPERATOR": "color:#FF7B7B;font-weight:600",
             "ESCALATE_TO_HUMAN": "color:#F59E0B;font-weight:600",
         }
         return palette.get(value, "color:#8E95A5")
 
     st.dataframe(
-        table.style.map(_status_color, subset=["Status Agent"]).format(
-            {"Temp Răcire (°C)": "{:.1f}", "Capacitate (MW)": "{:.1f}", "Ofertă (MW)": "{:.2f}", "Preț Fix (€/MWh)": "{:.2f}"}
+        table_df.style.map(_status_color, subset=["Status Agent"]).format(
+            {
+                "Temp Răcire (°C)": "{:.1f}",
+                "Cutoff (°C)": "{:.1f}",
+                "Capacitate (MW)": "{:.2f}",
+                "Ofertă (MW)": "{:.2f}",
+                "Preț Ofertă (€/MWh)": "{:.1f}",
+                "Contract (€/MWh)": "{:.1f}",
+            }
         ),
         hide_index=True,
         width="stretch",
     )
 
+    # ---------------- Expanders: Fallback Cascade & XAI TreeSHAP ----------------
+    exp_col1, exp_col2 = st.columns(2, gap="medium")
+    with exp_col1:
+        fb = decision.fallback
+        fallback_pending = (
+            max(0.0, fb.ppc_blue_ev_mw - decision.executed_ppc_blue_ev_mw)
+            + max(0.0, fb.bess_storage_mw - decision.executed_bess_storage_mw)
+            + max(0.0, fb.curtailment_mw - decision.executed_curtailment_mw)
+            if fb
+            else 0.0
+        )
+        with st.expander(
+            f"🔋 Cascadă Fallback PPC (EV / BESS / Curtailment) · De aprobat: {fallback_pending:.2f} MW",
+            expanded=fallback_pending > 0.01 or decision.executed_ppc_blue_ev_mw > 0,
+        ):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Treaptă Fallback": label,
+                            "Planificat (MW)": getattr(fb, field, 0.0),
+                            "Executat (MW)": executed_val,
+                            "În Așteptare (MW)": max(0.0, getattr(fb, field, 0.0) - executed_val),
+                        }
+                        for label, field, executed_val in (
+                            ("Treapta 1 · Stații EV PPC Blue (≤3.5 MW)", "ppc_blue_ev_mw", decision.executed_ppc_blue_ev_mw),
+                            ("Treapta 2 · Baterii Industriale BESS (≤4.0 MW)", "bess_storage_mw", decision.executed_bess_storage_mw),
+                            ("Treapta 3 · Curtailment Asistat SCADA", "curtailment_mw", decision.executed_curtailment_mw),
+                        )
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+            st.button(
+                "✅ Aprobă Fallback EV / BESS / Curtailment (Simulare HITL)",
+                key=f"{decision.decision_id}_PPC_FALLBACK_r{decision.fallback_plan_revision}_APPROVED",
+                type="primary",
+                width="stretch",
+                disabled=(
+                    fallback_pending <= 1e-9
+                    or decision.confidence_score < 0.75
+                    or decision.status == "DATA_ERROR"
+                ),
+                on_click=transact,
+                args=(
+                    tx_key,
+                    decision.decision_id,
+                    "PPC_FALLBACK",
+                    "APPROVED",
+                    decision.fallback_plan_revision,
+                ),
+            )
+
+    with exp_col2:
+        with st.expander("🧠 Explicabilitate XAI (TreeSHAP) & Metrici XGBoost vs. Baseline", expanded=True):
+            if forecast.top_shap_features:
+                s_names = list(forecast.top_shap_features.keys())
+                s_vals = [forecast.top_shap_features[k] for k in s_names]
+                s_pcts = [forecast.shap_percentages.get(k, 0.0) for k in s_names]
+                shap_fig = go.Figure(
+                    go.Bar(
+                        y=s_names,
+                        x=s_pcts,
+                        orientation="h",
+                        text=[f"{p:.1f}% ({v:+.4f} MW)" for p, v in zip(s_pcts, s_vals)],
+                        textposition="auto",
+                        marker_color=["#00FF9D" if v >= 0 else "#38BDF8" for v in s_vals],
+                    )
+                )
+                shap_fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="JetBrains Mono, monospace", color="#8E95A5", size=10),
+                    height=155,
+                    margin=dict(l=5, r=10, t=5, b=5),
+                    xaxis=dict(title="Pondere |SHAP| Top 3 (%)", range=[0, 110], gridcolor="rgba(255,255,255,0.05)"),
+                )
+                st.plotly_chart(shap_fig, width="stretch", key="xai_shap_chart")
+            metrics = (agent.model_artifact or {}).get("metrics", {})
+            m_rows = [
+                {
+                    "Model (t+2h)": label,
+                    "MAE (MW)": round(metrics[m_key]["mae"], 5),
+                    "RMSE (MW)": round(metrics[m_key]["rmse"], 5),
+                    "R²": round(metrics[m_key]["r2"], 4),
+                }
+                for m_key, label in (
+                    ("xgboost", "XGBoost Regressor (VoltCompute)"),
+                    ("baseline_seasonal", "Baseline Sezonier 24h y(t-22)"),
+                    ("baseline_persistence", "Baseline Persistență y(t)"),
+                )
+                if m_key in metrics
+            ]
+            if m_rows:
+                st.dataframe(pd.DataFrame(m_rows), hide_index=True, width="stretch")
+
+
 # =====================================================================
-# SECONDARY COLUMN: DATACENTER CLIENT VIEW (UPB)
+# SECONDARY COLUMN: DATACENTER CLIENT VIEW (SLURM / K8S MODALS)
 # =====================================================================
 with col_modal:
-    st.markdown('<div class="vc-sub" style="margin-bottom:8px;">DATACENTER CLIENT VIEW</div>', unsafe_allow_html=True)
-    upb = next(a for a in allocs_T if a["id"] == "ROEDUNET-UPB-BUC")
+    st.markdown(
+        '<div class="vc-sub" style="margin-bottom:8px;">DATACENTER CLIENT VIEW · SLURM / K8S DISPATCH</div>',
+        unsafe_allow_html=True,
+    )
+    if "action_error" in st.session_state:
+        st.error(st.session_state.pop("action_error"))
 
-    if upb["allocated_mw"] > 0:
-        window_hours = 1
-        for i in future_idx:
-            if future_surplus[i] > agent.MIN_SURPLUS_THRESHOLD_MW:
-                window_hours += 1
-            else:
-                break
-        savings = upb["allocated_mw"] * window_hours * (REFERENCE_TARIFF_EUR - FIXED_PRICE_EUR)
+    if tx["result"] is not None:
+        res = tx["result"]
         st.markdown(
             f"""
-<div class="vc-modal">
-  <div class="vc-modal-head">🔔 ROEDUNET SLURM DAEMON</div>
-  <div class="vc-modal-title">INCOMING POWER DISPATCH OFFER</div>
+<div class="vc-alert vc-alert-green" style="padding:8px 12px;margin-bottom:10px;">
+  ⚡ <b>{res['execution_state']}</b> · Absorbție: <b>{ decision.executed_absorbed_mw:.2f} MW</b> ·
+  CO₂ evitat: <b>{(decision.executed_mw + decision.executed_ppc_blue_ev_mw) * 0.28:.2f} t</b>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+    for offer in decision.dc_offers:
+        meta = NODE_META.get(
+            offer.dc_id,
+            {
+                "name": offer.dc_name,
+                "short": offer.dc_id,
+                "daemon": f"{offer.dc_id} SLURM DAEMON",
+                "queue": 20,
+                "color": "#00FF9D",
+            },
+        )
+        q_total = int(meta["queue"])
+        jobs_cnt = (
+            max(1, int(round(q_total * offer.offered_mw / max(offer.available_capacity_mw, 0.1))))
+            if offer.offered_mw > 0
+            else 0
+        )
+        savings_eur = offer.offered_mw * (offer.contract_price_eur - offer.offered_price_eur)
+
+        if offer.status in ("OFFER_GENERATED", "ACCEPTED"):
+            badge_txt = "✅ ACCEPTED & RUNNING" if offer.status == "ACCEPTED" else f"🔔 ACTIVE FLASH DEAL · RUNDĂ #{offer.auction_round}"
+            st.markdown(
+                f"""
+<div class="vc-modal" style="border-left: 3px solid {meta['color']};">
+  <div class="vc-modal-head">{meta['daemon']} · {badge_txt}</div>
+  <div class="vc-modal-title">{meta['name']}</div>
   <div class="vc-modal-body">
-    PPC Dispatcher oferă <span class="vc-mono" style="color:#00FF9D;">{upb['allocated_mw']:.2f} MW</span> surplus solar
-    pentru următoarele <span class="vc-mono">{window_hours}</span> ore la
-    <span class="vc-mono" style="color:#00FF9D;">{FIXED_PRICE_EUR:.2f} €/MWh</span>
-    (vs <span class="vc-mono">{REFERENCE_TARIFF_EUR:.2f} €/MWh</span> tarif standard).
+    PPC Dispatcher oferă <span class="vc-mono" style="color:#00FF9D;font-weight:700;">{offer.offered_mw:.2f} MW</span>
+    pentru fereastra <span class="vc-mono">{target_dt.strftime('%H:%M')}–{(target_dt + timedelta(hours=1)).strftime('%H:%M')}</span> la
+    <span class="vc-mono" style="color:#00FF9D;font-weight:700;">{offer.offered_price_eur:.0f} €/MWh</span>
+    (discount <span class="vc-mono">{offer.discount_pct:.0f}%</span> vs <span class="vc-mono">{offer.contract_price_eur:.0f} €/MWh</span> contract ·
+    răcire <span class="vc-mono">{offer.current_temp_c:.1f}°C</span>).
   </div>
 </div>
 """,
-            unsafe_allow_html=True,
-        )
-        k1, k2 = st.columns(2)
-        k1.metric("Economie estimată", f"-{savings:,.2f} €")
-        k2.metric("Joburi AI pornite", f"{upb['jobs']}/{upb['queue']}")
-
-        already = st.session_state.accepted.get(T)
-        if already == "ACCEPTED":
-            st.success("Ofertă acceptată pentru acest pas.")
-        elif already == "REFUSED":
-            st.info("Ofertă refuzată pentru acest pas.")
-        b_accept, b_refuse = st.columns(2)
-        if b_accept.button("Acceptă & Scalează GPU-uri", key=f"accept_{T}", type="primary", width="stretch"):
-            st.session_state.accepted[T] = "ACCEPTED"
-            st.toast("✅ GPU Nodes scaled to 100% capacity.")
-            st.rerun()
-        if b_refuse.button("Refuză", key=f"refuse_{T}", width="stretch"):
-            st.session_state.accepted[T] = "REFUSED"
-            st.toast("Ofertă refuzată de administratorul UPB.")
-            st.rerun()
-    else:
-        reason = (
-            "Încredere model sub prag - decizie la dispecer."
-            if surplus_T > agent.MIN_SURPLUS_THRESHOLD_MW
-            else f"Surplus {surplus_T:.2f} MW sub pragul de {agent.MIN_SURPLUS_THRESHOLD_MW:.1f} MW."
-        )
-        st.markdown(
-            f"""
-<div class="vc-modal">
-  <div class="vc-modal-head">🔔 ROEDUNET SLURM DAEMON</div>
-  <div class="vc-modal-title">NO ACTIVE OFFER</div>
-  <div class="vc-modal-body">{reason} Cluster-ul rămâne pe alimentare standard.</div>
+                unsafe_allow_html=True,
+            )
+            k1, k2 = st.columns(2)
+            k1.metric("Economie estimată (1h)", f"-{savings_eur:,.2f} €")
+            k2.metric("Joburi AI/HPC pornite", f"{jobs_cnt}/{q_total}")
+        else:
+            status_reason = {
+                "REJECTED_THERMAL_SAFETY": f"🔥 PROTECȚIE TERMICĂ: Servere la {offer.current_temp_c:.1f}°C (peste pragul de siguranță {offer.thermal_limit_c - 1.5:.1f}°C). Transfer blocat.",
+                "ESCALATE_TO_HUMAN": f"⚠️ INCERTITUDINE METEO: Confidență ML ({decision.confidence_score:.0%}) sub 75% — în așteptarea dispecerului uman.",
+                "REJECTED_BY_OPERATOR": "❌ OFERTĂ REFUZATĂ: Megawații au fost rerutați automat către următoarele noduri / cascada PPC Blue EV & BESS.",
+                "STANDBY": "● STANDBY: Capacitate disponibilă în rezervă pentru rerutare.",
+            }.get(offer.status, offer.status)
+            st.markdown(
+                f"""
+<div class="vc-modal" style="opacity:0.85;">
+  <div class="vc-modal-head">{meta['daemon']} · {offer.status}</div>
+  <div class="vc-modal-title">{meta['name']}</div>
+  <div class="vc-modal-body">{status_reason}</div>
 </div>
 """,
-            unsafe_allow_html=True,
+                unsafe_allow_html=True,
+            )
+
+        btn_disabled = (
+            offer.status != "OFFER_GENERATED"
+            or decision.confidence_score < 0.75
+            or decision.status == "DATA_ERROR"
+        )
+        b_acc, b_neg, b_ref = st.columns([1.3, 1.1, 0.9], gap="small")
+        b_acc.button(
+            "Acceptă & Scalează",
+            key=f"{decision.decision_id}_{offer.dc_id}_APPROVED",
+            type="primary",
+            width="stretch",
+            disabled=btn_disabled,
+            on_click=transact,
+            args=(tx_key, decision.decision_id, offer.dc_id, "APPROVED"),
+        )
+        b_neg.button(
+            "−10 €/MWh",
+            key=f"{decision.decision_id}_{offer.dc_id}_DUTCH_AUCTION_STEP",
+            type="secondary",
+            width="stretch",
+            disabled=btn_disabled or offer.offered_price_eur <= 10.0,
+            on_click=transact,
+            args=(tx_key, decision.decision_id, offer.dc_id, "DUTCH_AUCTION_STEP"),
+        )
+        b_ref.button(
+            "Refuză",
+            key=f"{decision.decision_id}_{offer.dc_id}_REJECTED",
+            type="secondary",
+            width="stretch",
+            disabled=btn_disabled,
+            on_click=transact,
+            args=(tx_key, decision.decision_id, offer.dc_id, "REJECTED"),
         )
 
+
 # =====================================================================
-# AUTO-STEP
+# AUTO-STEP LIVE FEED
 # =====================================================================
 if st.session_state.autoplay:
     time.sleep(AUTOPLAY_SECONDS)

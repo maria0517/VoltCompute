@@ -1,137 +1,97 @@
+"""FastAPI aliases share one validated, stateful HITL execution core."""
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 from agent import VoltComputeAgent
-from schemas import (
-    AgentDecision,
-    DispatchAction,
-    GridTelemetry,
-    ResearchCenterTelemetry,
-)
+from schemas import (AgentDecision, DispatchAction, DispatchResponse, EvaluateRequest,
+                     GridStatusResponse, HealthResponse, SimulateScenarioRequest, SimulationResponse)
 from simulator import SCENARIO_DESCRIPTIONS, VoltComputeSimulator
+from train_pipeline import load_grid_status
 
-app = FastAPI(
-    title="VoltCompute API — 24h to Power PPC",
-    description=(
-        "Backend API pentru agentul AI de arbitraj al surplusului solar PPC "
-        "către centre universitare de calcul (RoEduNet / HPC)."
-    ),
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+app = FastAPI(title="VoltCompute API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+                   allow_methods=["*"], allow_headers=["*"])
 agent = VoltComputeAgent()
-simulator = VoltComputeSimulator(agent=agent)
-
-# Registru in-memory pentru auditul deciziilor și acțiunilor Human-in-the-Loop
+simulator = VoltComputeSimulator(agent)
 DECISION_STORE: Dict[str, AgentDecision] = {}
 DISPATCH_LOG: List[Dict[str, Any]] = []
 
 
-class EvaluateRequest(BaseModel):
-    """Payload compus pentru endpoint-ul POST /api/evaluate."""
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc):
+    # Pydantic/FastAPI normally echo raw invalid inputs (including PII). Never do so.
+    # Transport/schema failures (including non-JSON NaN/Infinity) are HTTP 422.
+    # Valid envelopes with invalid telemetry reaching run_cycle return DATA_ERROR.
+    return JSONResponse(status_code=422, content={"detail": "Invalid request schema; no agent decision or execution was performed."})
 
-    grid: Dict[str, Any]
-    center: Dict[str, Any]
-    confidence_override: Optional[float] = None
+
+@app.get("/health", response_model=HealthResponse)
+def health_check():
+    loaded = agent.model_artifact is not None
+    return dict(status="healthy" if loaded else "degraded", timestamp=datetime.now().isoformat(),
+                ml_model_loaded=loaded, metrics=agent.model_artifact["metrics"] if loaded else {},
+                available_scenarios=list(SCENARIO_DESCRIPTIONS))
 
 
-@app.get("/health")
-def health_check() -> Dict[str, Any]:
-    """Verifică starea serviciului și încărcarea modelului ML."""
-    return {
-        "status": "healthy",
-        "service": "VoltCompute API",
-        "timestamp": datetime.now().isoformat(),
-        "ml_model_loaded": agent.model_artifact is not None,
-        "available_scenarios": list(SCENARIO_DESCRIPTIONS.keys()),
-    }
+@app.get("/api/grid-status", response_model=GridStatusResponse)
+def grid_status(step: int = Query(default=37, ge=0, le=719)):
+    try:
+        return load_grid_status(step)
+    except (ValueError, OSError):
+        raise HTTPException(503, "CSV telemetry unavailable") from None
 
 
 @app.post("/api/evaluate", response_model=AgentDecision)
-def evaluate_telemetry(payload: EvaluateRequest) -> AgentDecision:
-    """
-    Evaluează telemetria curentă (rețea PPC + centru universitar) și returnează
-    decizia structurată a agentului (AgentDecision).
-    """
-    decision = agent.run_cycle(
-        grid_input=payload.grid,
-        center_input=payload.center,
-        confidence_override=payload.confidence_override,
-    )
+@app.post("/api/evaluate-arbitrage", response_model=AgentDecision)
+def evaluate_telemetry(payload: EvaluateRequest):
+    decision = agent.run_cycle(payload.grid, payload.center, payload.confidence_override, payload.data_centers)
     DECISION_STORE[decision.decision_id] = decision
     return decision
 
 
-@app.post("/api/dispatch")
-def dispatch_decision(action: DispatchAction) -> Dict[str, Any]:
-    """
-    Înregistrează confirmarea sau respingerea unei decizii (Human-in-the-Loop)
-    și declanșează execuția prin agent.act().
-    """
-    stored_decision = DECISION_STORE.get(action.decision_id)
-    if stored_decision is None:
-        # Dacă decizia provine dintr-o sesiune externă, construim un obiect de bază
-        stored_decision = AgentDecision(
-            decision_id=action.decision_id,
-            surplus_predicted_mw=4.2,
-            confidence_score=0.85,
-            status="OFFER_GENERATED" if action.action == "APPROVED" else "NORMAL_GRID_OPERATION",
-            allocated_mw=4.2 if action.action == "APPROVED" else 0.0,
-            fixed_price_eur=30.0,
-            reasoning=f"Comandă manuală dispecer ({action.action}) pentru {action.center_id}.",
-            top_shap_features={},
-        )
-
-    act_payload = agent.act(
-        decision=stored_decision,
-        dispatch_action=action,
-    )
-    log_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "dispatch_action": action.model_dump(),
-        "execution_result": act_payload,
-    }
-    DISPATCH_LOG.append(log_entry)
-    return log_entry
+@app.post("/api/dispatch", response_model=DispatchResponse)
+@app.post("/api/actions/execute", response_model=DispatchResponse)
+def dispatch_decision(action: DispatchAction):
+    decision = DECISION_STORE.get(action.decision_id)
+    if decision is None:
+        raise HTTPException(404, "Unknown decision ID")
+    try:
+        result = agent.act(decision, dispatch_action=action)
+    except ValueError:
+        raise HTTPException(409, "Action blocked: unknown center, inactive offer or safety constraint") from None
+    DECISION_STORE[decision.decision_id] = AgentDecision.model_validate(result["decision"])
+    response = dict(**result, timestamp=datetime.now().isoformat(), dispatch_action=action.model_dump(), execution_result=result)
+    DISPATCH_LOG.append(response)
+    return response
 
 
-@app.get("/api/simulation/{scenario_name}")
-def run_simulation(scenario_name: str) -> Dict[str, Any]:
-    """
-    Rulează simularea pe 24 de ore pentru unul dintre cele 3 scenarii de demo:
-    - CRITICAL_SOLAR_SUNDAY
-    - UNCERTAIN_WEATHER_SHOCK
-    - DATACENTER_THERMAL_RISK
-    """
+def _simulate(payload):
+    try:
+        timeline = simulator.generate_real_24h_scenario(payload.scenario_name, payload.custom,
+                                                       payload.start_step, payload.simulate_approvals)
+        # Validate before storing or returning, including user-supplied custom fields.
+        result = SimulationResponse.model_validate(dict(scenario_name=payload.scenario_name,
+            description="Real CSV scenario; interventions and optional operator approvals are simulated.",
+            impact_kpis=simulator.calculate_impact([s["decision"] for s in timeline]), timeline=timeline))
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(422, "Invalid scenario telemetry") from None
+    for step in result.timeline:
+        DECISION_STORE[step.decision.decision_id] = step.decision
+    return result
+
+
+@app.get("/api/simulation/{scenario_name}", response_model=SimulationResponse)
+def run_simulation(scenario_name: str):
     if scenario_name not in SCENARIO_DESCRIPTIONS:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": f"Scenariul '{scenario_name}' nu există.",
-                "valid_scenarios": list(SCENARIO_DESCRIPTIONS.keys()),
-            },
-        )
+        raise HTTPException(404, "Unknown scenario")
+    return _simulate(SimulateScenarioRequest(scenario_name=scenario_name))
 
-    timeline = simulator.generate_24h_scenario(scenario_name)
-    decisions = [step["decision"] for step in timeline]
-    impact = simulator.calculate_impact(decisions)
 
-    return {
-        "scenario_name": scenario_name,
-        "description": SCENARIO_DESCRIPTIONS[scenario_name],
-        "impact_kpis": impact,
-        "timeline": timeline,
-    }
-
+@app.post("/api/simulate-scenario", response_model=SimulationResponse)
+def simulate_scenario(payload: SimulateScenarioRequest):
+    return _simulate(payload)

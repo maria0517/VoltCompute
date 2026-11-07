@@ -4,7 +4,9 @@ from typing import Any, Dict, List, Literal
 import numpy as np
 
 from agent import VoltComputeAgent
-from schemas import AgentDecision, GridTelemetry, ResearchCenterTelemetry
+from schemas import AgentDecision, DispatchAction, GridTelemetry, ResearchCenterTelemetry
+from train_pipeline import load_grid_status
+from copy import deepcopy
 
 ScenarioName = Literal[
     "CRITICAL_SOLAR_SUNDAY",
@@ -30,6 +32,38 @@ SCENARIO_DESCRIPTIONS: Dict[str, str] = {
 }
 
 
+def load_scenario_status(scenario_name="REAL_CSV", step=35, custom=None):
+    """Shared API/UI scenario contract. Named demos inject +8 MW during 09:00–16:00.
+
+    The CSV grid/model_features remain the ML population; injection is a separate
+    dispatch quota. Solar demo market price -15 is a separate scenario quote, not
+    a fabricated model input. Returns load_grid_status keys plus base_grid,
+    scenario_name, scenario_active and demo_injected_surplus_mw.
+    """
+    if scenario_name not in {"REAL_CSV", *SCENARIO_DESCRIPTIONS}:
+        raise ValueError("Unknown scenario")
+    status = deepcopy(load_grid_status(step))
+    status["base_grid"] = deepcopy(status["grid"])
+    grid, centers = status["grid"], status["data_centers"]
+    active = scenario_name != "REAL_CSV" and 9 <= grid["hour"] <= 16
+    grid["scenario_name"] = scenario_name
+    grid["demo_injected_surplus_mw"] = 8. if active else 0.
+    if active and scenario_name == "CRITICAL_SOLAR_SUNDAY":
+        grid["demo_market_price_eur_mwh"] = -15.
+        status["price_pzu_eur_mwh"] = -15.
+    if active and scenario_name == "UNCERTAIN_WEATHER_SHOCK":
+        grid["weather_stability_index"] = .58
+    if active and scenario_name == "DATACENTER_THERMAL_RISK":
+        centers[0]["temp_servere_c"] = 28.5
+    custom = custom or {}
+    grid.update(custom.get("grid", {}))
+    status["data_centers"] = deepcopy(custom.get("data_centers", centers))
+    status.update(scenario_name=scenario_name, scenario_active=active,
+                  demo_injected_surplus_mw=grid["demo_injected_surplus_mw"],
+                  confidence_override=custom.get("confidence_override"))
+    return status
+
+
 class VoltComputeSimulator:
     """
     Motorul de simulare pe 24 de ore folosit în Pitch & Demo pentru a demonstra:
@@ -51,9 +85,7 @@ class VoltComputeSimulator:
         rulând agentul VoltCompute la fiecare oră.
         """
         if scenario_name not in SCENARIO_DESCRIPTIONS:
-            raise ValueError(
-                f"Scenariu necunoscut '{scenario_name}'. Valori suportate: {list(SCENARIO_DESCRIPTIONS.keys())}"
-            )
+            raise ValueError("Unknown scenario")
 
         base_date = datetime(2026, 6, 21, 0, 0, 0)
         timeline: List[Dict[str, Any]] = []
@@ -133,6 +165,13 @@ class VoltComputeSimulator:
                 confidence_override=stability_idx,
             )
 
+            # Historical demo explicitly simulates an operator accepting each safe offer.
+            # This is not automatic production dispatch and sends no network request.
+            if decision.status == "OFFER_GENERATED":
+                result = self.agent.act(decision, dispatch_action=DispatchAction(
+                    decision_id=decision.decision_id, center_id=center_telemetry.center_id, action="APPROVED"))
+                decision = AgentDecision.model_validate(result["decision"])
+
             # Calculăm puterea netă injectată în rețea pentru vizualizarea Plotly
             temp_derating = 1.0 - max(0.0, (ambient_temp - 25.0) * 0.004)
             gross_solar_mw = (irr / 1000.0) * 17.8 * temp_derating
@@ -148,9 +187,47 @@ class VoltComputeSimulator:
                     "grid_telemetry": grid_telemetry.model_dump(),
                     "center_telemetry": center_telemetry.model_dump(),
                     "decision": decision.model_dump(),
+                    "simulation_mode": "legacy_synthetic_operator_approvals_simulated",
                 }
             )
 
+        return timeline
+
+    def generate_real_24h_scenario(self, scenario_name, custom=None, start_step=48, simulate_approvals=False):
+        """Real CSV timeline with explicit scenario interventions; default is planning only.
+
+        custom: optional {grid: partial telemetry, data_centers: CSV-shaped list,
+        confidence_override: float}. Overrides are validated by the agent, never evaluated as code.
+        """
+        if scenario_name not in SCENARIO_DESCRIPTIONS:
+            raise ValueError("Unknown scenario")
+        if not isinstance(start_step, int) or start_step < 24 or start_step+23 >= 720:
+            raise ValueError("Scenario requires 24 available hours after lag warm-up")
+        custom = custom or {}
+        timeline = []
+        for step in range(start_step, start_step+24):
+            status = load_scenario_status(scenario_name, step, custom)
+            grid, centers = status["grid"], status["data_centers"]
+            hour = grid["hour"]
+            decision = self.agent.run_cycle(grid, data_centers=centers,
+                                           confidence_override=custom.get("confidence_override"))
+            if simulate_approvals and decision.status == "OFFER_GENERATED":
+                for offer in decision.dc_offers:
+                    if offer.status == "OFFER_GENERATED":
+                        result = self.agent.act(decision, dispatch_action=DispatchAction(
+                            decision_id=decision.decision_id, center_id=offer.dc_id, action="APPROVED"))
+                        decision = AgentDecision.model_validate(result["decision"])
+            if simulate_approvals and decision.confidence_score >= .75 and decision.fallback and (
+                decision.fallback.total_fallback_absorbed_mw+decision.fallback.curtailment_mw > 0
+            ):
+                result = self.agent.act(decision, dispatch_action=DispatchAction(
+                    decision_id=decision.decision_id, center_id="PPC_FALLBACK", action="APPROVED"))
+                decision = AgentDecision.model_validate(result["decision"])
+            timeline.append(dict(step=step, hour=hour, hour_label=f"{hour:02d}:00",
+                timestamp=grid["timestamp"], grid_telemetry=grid, data_centers=centers,
+                net_solar_generation_mw=grid["current_surplus_mw"], grid_capacity_limit_mw=grid["grid_capacity_limit_mw"],
+                decision=decision.model_dump(), simulation_mode="real_csv_scenario_intervention",
+                operator_approvals_simulated=simulate_approvals))
         return timeline
 
     def calculate_impact(
@@ -169,16 +246,16 @@ class VoltComputeSimulator:
         ]
 
         total_surplus_mwh = sum(d.surplus_predicted_mw for d in parsed_decisions)
-        mwh_saved = sum(
-            d.allocated_mw for d in parsed_decisions if d.status == "OFFER_GENERATED"
-        )
-        unabsorbed_curtailment_mwh = max(0.0, total_surplus_mwh - mwh_saved)
+        total_excess = sum(d.grid_excess_mw for d in parsed_decisions)
+        mwh_saved = sum(min(max(0., d.grid_excess_mw-d.executed_curtailment_mw), d.executed_absorbed_mw) for d in parsed_decisions)
+        planned_mwh = sum(d.allocated_mw for d in parsed_decisions)
+        unabsorbed_curtailment_mwh = sum(max(0., d.grid_excess_mw-d.executed_absorbed_mw-d.executed_curtailment_mw) for d in parsed_decisions)
 
-        ppc_revenue_eur = mwh_saved * self.FIXED_GREEN_PRICE_EUR
-        researcher_savings_eur = mwh_saved * (
-            self.STANDARD_RETAIL_PRICE_EUR - self.FIXED_GREEN_PRICE_EUR
-        )
-        co2_avoided_tons = mwh_saved * self.CO2_TONS_PER_MWH
+        accepted = [o for d in parsed_decisions for o in d.dc_offers if o.status == "ACCEPTED"]
+        ppc_revenue_eur = sum(o.offered_mw*o.offered_price_eur for o in accepted)
+        researcher_savings_eur = sum(o.offered_mw*(o.contract_price_eur-o.offered_price_eur) for o in accepted)
+        # Stored energy is not credited as avoided emissions before discharge.
+        co2_avoided_tons = sum(d.executed_mw+d.executed_ppc_blue_ev_mw for d in parsed_decisions) * self.CO2_TONS_PER_MWH
 
         offers_count = sum(1 for d in parsed_decisions if d.status == "OFFER_GENERATED")
         escalations_count = sum(
@@ -186,6 +263,16 @@ class VoltComputeSimulator:
         )
 
         return {
+            "execution_mode": "simulated",
+            "predicted_export_mwh": round(sum(d.predicted_export_mw for d in parsed_decisions), 4),
+            "demo_injected_surplus_mwh": round(sum(d.demo_injected_surplus_mw for d in parsed_decisions), 4),
+            "grid_excess_mwh": round(total_excess, 4),
+            "executed_absorbed_mwh": round(sum(d.executed_absorbed_mw for d in parsed_decisions), 4),
+            "executed_curtailment_mwh": round(sum(d.executed_curtailment_mw for d in parsed_decisions), 4),
+            "remaining_grid_excess_mwh": round(unabsorbed_curtailment_mwh, 4),
+            "curtailment_kpi_semantics": "excess_above_grid_limit_only; executed_curtailment_is_not_energy_saved",
+            "planned_mwh": round(planned_mwh, 4),
+            "planned_revenue_eur": round(sum(o.offered_mw*o.offered_price_eur for d in parsed_decisions for o in d.dc_offers), 2),
             "mwh_saved_from_curtailment": round(mwh_saved, 2),
             "total_surplus_mwh": round(total_surplus_mwh, 2),
             "unabsorbed_curtailment_mwh": round(unabsorbed_curtailment_mwh, 2),

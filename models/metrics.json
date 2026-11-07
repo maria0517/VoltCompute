@@ -1,27 +1,148 @@
 {
-  "trained_at": "2026-11-07T15:21:49.930306",
-  "model_type": "HistGradientBoostingRegressor (fallback fara libomp)",
-  "dataset_rows": 1440,
-  "train_rows": 1152,
-  "test_rows": 288,
-  "split_strategy": "train_test_split(shuffle=False, test_size=0.2)",
-  "baseline_dummy": {
-    "mae": 0.941,
-    "rmse": 1.4248
+  "xgboost": {
+    "mae": 0.006882873560029934,
+    "rmse": 0.014689864848983691,
+    "r2": 0.9840782667769232
   },
-  "xgboost_regressor": {
-    "mae": 0.0395,
-    "rmse": 0.1108
+  "baseline_persistence": {
+    "mae": 0.05828489208633093,
+    "rmse": 0.09997342710249911,
+    "r2": 0.2625647344677253
   },
-  "improvement_pct": {
-    "mae_reduction_pct": 95.81,
-    "rmse_reduction_pct": 92.22
+  "baseline_seasonal": {
+    "mae": 0.010565755395683454,
+    "rmse": 0.022385889794031055,
+    "r2": 0.9630254016294786
   },
-  "feature_importances": {
-    "hour": 0.0039,
-    "solar_irradiance_wm2": 0.9942,
-    "ambient_temp_celsius": 0.0006,
-    "day_ahead_price_eur": 0.0013,
-    "grid_capacity_limit_mw": 0.0
-  }
+  "test_mae": 0.006882873560029934,
+  "test_rmse": 0.014689864848983691,
+  "test_r2": 0.9840782667769232,
+  "baseline_persistence_mae": 0.05828489208633093,
+  "baseline_seasonal_mae": 0.010565755395683454,
+  "train_mae": 0.0030837037555897224,
+  "train_rows": 553,
+  "test_rows": 139,
+  "purged_rows": 2,
+  "prediction_horizon_hours": 2,
+  "train_last_target": "2026-05-25T02:00:00",
+  "test_first_timestamp": "2026-05-25T03:00:00",
+  "forecast_horizons": {
+    "2": {
+      "xgboost": {
+        "mae": 0.006882873560029934,
+        "rmse": 0.014689864848983691,
+        "r2": 0.9840782667769232
+      },
+      "baseline_persistence": {
+        "mae": 0.05828489208633093,
+        "rmse": 0.09997342710249911,
+        "r2": 0.2625647344677253
+      },
+      "baseline_seasonal": {
+        "mae": 0.010565755395683454,
+        "rmse": 0.022385889794031055,
+        "r2": 0.9630254016294786
+      },
+      "test_mae": 0.006882873560029934,
+      "test_rmse": 0.014689864848983691,
+      "test_r2": 0.9840782667769232,
+      "baseline_persistence_mae": 0.05828489208633093,
+      "baseline_seasonal_mae": 0.010565755395683454,
+      "train_mae": 0.0030837037555897224,
+      "train_rows": 553,
+      "test_rows": 139,
+      "purged_rows": 2,
+      "prediction_horizon_hours": 2,
+      "train_last_target": "2026-05-25T02:00:00",
+      "test_first_timestamp": "2026-05-25T03:00:00"
+    },
+    "1": {
+      "xgboost": {
+        "mae": 0.007473940629690112,
+        "rmse": 0.015765364933571013,
+        "r2": 0.9816615426827281
+      },
+      "baseline_persistence": {
+        "mae": 0.03107812949640288,
+        "rmse": 0.05647949665538852,
+        "r2": 0.7646379827137368
+      },
+      "baseline_seasonal": {
+        "mae": 0.010565755395683454,
+        "rmse": 0.022385889794031055,
+        "r2": 0.9630254016294786
+      },
+      "test_mae": 0.007473940629690112,
+      "test_rmse": 0.015765364933571013,
+      "test_r2": 0.9816615426827281,
+      "baseline_persistence_mae": 0.03107812949640288,
+      "baseline_seasonal_mae": 0.010565755395683454,
+      "train_mae": 0.0027814027673688977,
+      "train_rows": 554,
+      "test_rows": 139,
+      "purged_rows": 1,
+      "prediction_horizon_hours": 1,
+      "train_last_target": "2026-05-25T02:00:00",
+      "test_first_timestamp": "2026-05-25T03:00:00"
+    },
+    "3": {
+      "xgboost": {
+        "mae": 0.00953114376179801,
+        "rmse": 0.0192532854911564,
+        "r2": 0.9727729076509741
+      },
+      "baseline_persistence": {
+        "mae": 0.08438376811594202,
+        "rmse": 0.13703785879102529,
+        "r2": -0.37934432183892275
+      },
+      "baseline_seasonal": {
+        "mae": 0.010642318840579711,
+        "rmse": 0.02246685168504215,
+        "r2": 0.962925440498801
+      },
+      "test_mae": 0.00953114376179801,
+      "test_rmse": 0.0192532854911564,
+      "test_r2": 0.9727729076509741,
+      "baseline_persistence_mae": 0.08438376811594202,
+      "baseline_seasonal_mae": 0.010642318840579711,
+      "train_mae": 0.0038052214344126574,
+      "train_rows": 552,
+      "test_rows": 138,
+      "purged_rows": 3,
+      "prediction_horizon_hours": 3,
+      "train_last_target": "2026-05-25T02:00:00",
+      "test_first_timestamp": "2026-05-25T03:00:00"
+    },
+    "4": {
+      "xgboost": {
+        "mae": 0.008900951485220621,
+        "rmse": 0.017162929665205554,
+        "r2": 0.978461830761067
+      },
+      "baseline_persistence": {
+        "mae": 0.10704000000000001,
+        "rmse": 0.16407022473701763,
+        "r2": -0.9682736826827898
+      },
+      "baseline_seasonal": {
+        "mae": 0.01072,
+        "rmse": 0.02254869841032959,
+        "r2": 0.962823466177548
+      },
+      "test_mae": 0.008900951485220621,
+      "test_rmse": 0.017162929665205554,
+      "test_r2": 0.978461830761067,
+      "baseline_persistence_mae": 0.10704000000000001,
+      "baseline_seasonal_mae": 0.01072,
+      "train_mae": 0.0038454810137817405,
+      "train_rows": 551,
+      "test_rows": 137,
+      "purged_rows": 4,
+      "prediction_horizon_hours": 4,
+      "train_last_target": "2026-05-25T02:00:00",
+      "test_first_timestamp": "2026-05-25T03:00:00"
+    }
+  },
+  "pipeline_seconds": 1.5472073999990243
 }
