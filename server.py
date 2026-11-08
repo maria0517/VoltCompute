@@ -178,3 +178,54 @@ def rank_and_route(payload: RankRequest) -> Dict[str, Any]:
         "current_offer": pool.current_offer(),
         "ranking": pool.ranking,
     }
+
+
+@app.get("/api/weather/bucharest")
+def get_bucharest_weather_endpoint(
+    format_type: str = "macro",
+    forecast_days: int = 7,
+    past_days: int = 0,
+) -> Dict[str, Any]:
+    """
+    Endpoint pentru date meteo pe București (locația panourilor solare PPC).
+    Redenumește automat câmpurile din API în numele din headerele CSV existente:
+      - format_type="macro": conform 1_macro_vreme_piata.csv
+      - format_type="energy": conform energy_datacenter_data.csv
+    Suportă date din trecut (past_days) și din viitor (forecast_days).
+    """
+    from services.weather_service import (
+        BUCHAREST_LAT,
+        BUCHAREST_LON,
+        get_energy_datacenter_dataframe,
+        get_macro_weather_dataframe,
+    )
+
+    if format_type == "energy":
+        df = get_energy_datacenter_dataframe(forecast_days=forecast_days, past_days=past_days)
+    else:
+        df = get_macro_weather_dataframe(forecast_days=forecast_days, past_days=past_days)
+
+    return {
+        "location": "București",
+        "latitude": BUCHAREST_LAT,
+        "longitude": BUCHAREST_LON,
+        "format": format_type,
+        "past_days": past_days,
+        "forecast_days": forecast_days,
+        "records_count": len(df),
+        "columns": list(df.columns),
+        "data": df.to_dict(orient="records"),
+    }
+
+
+@app.get("/api/weather/bucharest/lookahead")
+def get_bucharest_weather_lookahead_endpoint(
+    hours_ahead: int = 2,
+) -> Dict[str, Any]:
+    """
+    Endpoint pentru prognoza meteo în avans cu 2 ore (sau N ore) peste București,
+    folosită pentru generarea anticipată a ofertelor de arbitraj energetic.
+    """
+    from services.weather_service import get_weather_lookahead
+
+    return get_weather_lookahead(hours_ahead=hours_ahead)
