@@ -40,6 +40,11 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# Doar dispeceratul PPC logat are acces la hartă (logarea se face din pagina principală)
+if st.session_state.get("user", {}).get("role") != "ppc":
+    st.warning("Harta rețelei este disponibilă doar pentru dispeceratul PPC. Autentifică-te din pagina principală.")
+    st.stop()
+
 FIXED_PRICE_EUR = FIXED_TARIFF_EUR_MWH
 LOOKAHEAD_HOURS = 2
 HISTORY_HOURS = 24
