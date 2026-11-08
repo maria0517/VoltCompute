@@ -1,10 +1,13 @@
 import React, { useState } from "react";
+import { nf } from "../lib/format";
 import {
   ChartPoint,
   DashboardKPIs,
   ExplainabilityInfo,
   TimelineInfo,
 } from "../types/telemetry";
+import { Card } from "./ui/Card";
+import { MetricCard } from "./ui/MetricCard";
 
 interface PpcDispatchPanelProps {
   timeline: TimelineInfo;
@@ -15,15 +18,19 @@ interface PpcDispatchPanelProps {
 }
 
 const FEATURE_LABELS: Record<string, string> = {
-  solar_irradiance_wm2: "Iradianță Solară (W/m²)",
-  clear_sky_proxy_mw: "Ancoră Fizică Panouri (MW)",
-  ambient_temp_celsius: "Temperatură Ambiantă (°C)",
-  day_ahead_price_eur: "Preț PZU (EUR/MWh)",
-  hour_sin: "Ciclu Diurn (Sin Oră)",
-  hour_cos: "Ciclu Diurn (Cos Oră)",
-  thermal_derating_factor: "Derating Termic Panouri",
-  net_load_factor_mw: "Sarcină Locală Rețea (MW)",
+  solar_irradiance_wm2: "Radiație solară",
+  clear_sky_proxy_mw: "Producție teoretică (cer senin)",
+  ambient_temp_celsius: "Temperatură ambientală",
+  day_ahead_price_eur: "Preț piață (PZU)",
+  hour_sin: "Ciclu zilnic (sin)",
+  hour_cos: "Ciclu zilnic (cos)",
+  thermal_derating_factor: "Pierderi termice panouri",
+  net_load_factor_mw: "Consum local",
 };
+
+const W = 960;
+const H = 300;
+const PAD = { l: 44, r: 16, t: 14, b: 28 };
 
 export const PpcDispatchPanel: React.FC<PpcDispatchPanelProps> = ({
   timeline,
@@ -34,226 +41,217 @@ export const PpcDispatchPanel: React.FC<PpcDispatchPanelProps> = ({
 }) => {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
-  const width = 920;
-  const height = 340;
-  const padLeft = 48;
-  const padRight = 24;
-  const padTop = 24;
-  const padBottom = 38;
-  const plotW = width - padLeft - padRight;
-  const plotH = height - padTop - padBottom;
-
+  const plotW = W - PAD.l - PAD.r;
+  const plotH = H - PAD.t - PAD.b;
   const maxVal = Math.max(16, yAxisMax);
-  const nPts = Math.max(1, chartPoints.length - 1);
+  const n = Math.max(1, chartPoints.length - 1);
 
-  const xOf = (i: number) => padLeft + (i / nPts) * plotW;
-  const yOf = (mw: number) => padTop + plotH - (Math.min(maxVal, Math.max(0, mw)) / maxVal) * plotH;
+  const xOf = (i: number) => PAD.l + (i / n) * plotW;
+  const yOf = (mw: number) => PAD.t + plotH - (Math.min(maxVal, Math.max(0, mw)) / maxVal) * plotH;
 
-  const limitY = yOf(kpis.grid_limit_mw);
-  const currentIdx = chartPoints.findIndex((p) => p.is_current);
+  const limit = kpis.grid_limit_mw;
+  const limitY = yOf(limit);
+  const nowIdx = chartPoints.findIndex((p) => p.is_current);
 
-  // Polylines
-  const predPath = chartPoints
+  const forecastPath = chartPoints
     .map((p, i) => `${i === 0 ? "M" : "L"}${xOf(i).toFixed(1)},${yOf(p.predicted_injection_mw).toFixed(1)}`)
     .join(" ");
 
-  const realPoints = chartPoints
-    .map((p, i) => (p.real_injection_mw !== null ? { i, val: p.real_injection_mw } : null))
-    .filter((x): x is { i: number; val: number } => x !== null);
-
-  const realPath = realPoints
-    .map((pt, idx) => `${idx === 0 ? "M" : "L"}${xOf(pt.i).toFixed(1)},${yOf(pt.val).toFixed(1)}`)
+  const measured = chartPoints
+    .map((p, i) => (p.real_injection_mw !== null ? { i, v: p.real_injection_mw } : null))
+    .filter((x): x is { i: number; v: number } => x !== null);
+  const measuredPath = measured
+    .map((m, k) => `${k === 0 ? "M" : "L"}${xOf(m.i).toFixed(1)},${yOf(m.v).toFixed(1)}`)
     .join(" ");
 
-  const shapEntries = Object.entries(explainability.top_shap_features).slice(0, 5);
-  const maxShap = Math.max(0.1, ...shapEntries.map(([, v]) => Math.abs(v)));
+  const ticks = [0, 4, 8, 12, 16].filter((t) => t <= maxVal && Math.abs(t - limit) > 1.2);
 
-  const hoveredPoint = hoverIdx !== null ? chartPoints[hoverIdx] : chartPoints[currentIdx] ?? chartPoints[0];
+  const hovered = hoverIdx !== null ? chartPoints[hoverIdx] : chartPoints[nowIdx] ?? chartPoints[0];
+
+  const shap = Object.entries(explainability.top_shap_features).slice(0, 5);
+  const maxShap = Math.max(0.1, ...shap.map(([, v]) => Math.abs(v)));
+
+  const overLimit = kpis.actual_injection_mw > limit;
+  const surplusTone = kpis.actual_surplus_mw > 0.1 ? "warning" : "neutral";
+
+  const checks = [
+    {
+      ok: kpis.surplus_mw > explainability.min_surplus_threshold_mw,
+      text: (
+        <>
+          Surplus prognozat <strong>{nf(kpis.surplus_mw)} MW</strong> (necesar peste{" "}
+          {nf(explainability.min_surplus_threshold_mw, 1)} MW)
+        </>
+      ),
+    },
+    {
+      ok: kpis.day_ahead_price_eur < explainability.max_pzu_price_eur,
+      text: (
+        <>
+          Preț piață <strong>{nf(kpis.day_ahead_price_eur)} €/MWh</strong> (necesar sub{" "}
+          {nf(explainability.max_pzu_price_eur, 1)})
+        </>
+      ),
+    },
+    {
+      ok: kpis.confidence >= explainability.confidence_threshold,
+      text: (
+        <>
+          Încredere model <strong>{nf(kpis.confidence * 100, 0)}%</strong> (necesar minim{" "}
+          {nf(explainability.confidence_threshold * 100, 0)}%)
+        </>
+      ),
+    },
+    {
+      ok: explainability.anomalies.length === 0,
+      text:
+        explainability.anomalies.length === 0 ? (
+          <>Senzori în parametri normali</>
+        ) : (
+          <>
+            Valori neobișnuite la senzori: <strong>{explainability.anomalies.join(", ")}</strong>
+          </>
+        ),
+    },
+  ];
 
   return (
-    <div>
-      <div className="vc-pane-head vc-pane-ppc">
-        INTERFAȚĂ PPC // DISPECERAT PARC SOLAR &amp; CONTROL CONGESTIE
-      </div>
-      <div className="vc-pane-sub">
-        Monitorizare injecție în linia de {kpis.grid_limit_mw.toFixed(0)} MW, predicție XGBoost (T+2h) și
-        venit din valorificarea surplusului
-      </div>
-
-      {/* 4 KPI Cards */}
-      <div className="vc-kpi-grid">
-        <div className="vc-metric-card">
-          <div className="vc-metric-label">Curent în Linie ({timeline.current_hour_str})</div>
-          <div className="vc-metric-value">{kpis.actual_injection_mw.toFixed(2)} MW</div>
-          <div
-            className="vc-metric-delta"
-            style={{
-              color: kpis.is_dispatched
-                ? "#00FF9D"
-                : kpis.actual_injection_mw > kpis.grid_limit_mw
-                ? "#FF7B7B"
-                : "#8E95A5",
-            }}
-          >
-            {kpis.is_dispatched
-              ? `↓ Redus de la ${kpis.raw_injection_mw.toFixed(2)} MW`
-              : `Predicție AI: ${kpis.predicted_injection_mw.toFixed(2)} MW`}
-          </div>
-        </div>
-
-        <div className="vc-metric-card">
-          <div className="vc-metric-label">Surplus Peste {kpis.grid_limit_mw.toFixed(0)} MW</div>
-          <div className="vc-metric-value">+{kpis.actual_surplus_mw.toFixed(2)} MW</div>
-          <div
-            className="vc-metric-delta"
-            style={{ color: kpis.actual_surplus_mw > 0.1 ? "#F59E0B" : "#00FF9D" }}
-          >
-            Confidență AI: {(kpis.confidence * 100).toFixed(0)}% · PZU {kpis.day_ahead_price_eur.toFixed(1)} €
-          </div>
-        </div>
-
-        <div className="vc-metric-card">
-          <div className="vc-metric-label">Profit Cumulat PPC</div>
-          <div className="vc-metric-value" style={{ color: "#00FF9D" }}>
-            +{kpis.cumulative_profit_eur.toLocaleString("ro-RO", { minimumFractionDigits: 2 })} €
-          </div>
-          <div className="vc-metric-delta" style={{ color: "#38BDF8" }}>
-            Ora curentă: +{kpis.revenue_eur.toFixed(2)} € ({kpis.delivered_mw.toFixed(2)} MWh)
-          </div>
-        </div>
-
-        <div className="vc-metric-card">
-          <div className="vc-metric-label">Echivalent AI Compute Verde</div>
-          <div className="vc-metric-value" style={{ color: "#38BDF8" }}>
-            {kpis.ai_tokens_millions.toFixed(1)}M Tokens
-          </div>
-          <div className="vc-metric-delta" style={{ color: "#00FF9D" }}>
-            🌱 {kpis.co2_saved_tons.toFixed(2)}t CO₂ evitate · {kpis.solar_irradiance_wm2.toFixed(0)} W/m²
-          </div>
-        </div>
-      </div>
-
-      {/* SCADA 24h + 2h Chart */}
-      <div className="vc-card">
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            marginBottom: 8,
-            fontFamily: "var(--font-mono)",
-            fontSize: "0.78rem",
+    <div className="stack">
+      <div className="kpi-grid">
+        <MetricCard
+          label="Injecție în linie"
+          value={nf(kpis.actual_injection_mw)}
+          unit="MW"
+          tone={overLimit ? "danger" : "neutral"}
+          meter={{
+            value: kpis.actual_injection_mw,
+            max: limit,
+            tone: overLimit ? "danger" : kpis.actual_injection_mw > limit * 0.85 ? "warning" : "info",
           }}
-        >
-          <span style={{ color: "#FFFFFF", fontWeight: 700 }}>
-            CURBA DE SARCINĂ SCADA (ULTIMELE 24H + PREDICȚIE AI T+2H)
-          </span>
-          {hoveredPoint && (
-            <span style={{ color: "#38BDF8" }}>
-              [{hoveredPoint.timestamp}] Real:{" "}
-              {hoveredPoint.real_injection_mw !== null
-                ? `${hoveredPoint.real_injection_mw.toFixed(2)} MW`
-                : "Viitor"}{" "}
-              · AI: {hoveredPoint.predicted_injection_mw.toFixed(2)} MW
-              {hoveredPoint.delivered_mw > 0.01 ? ` · Livrat DC: -${hoveredPoint.delivered_mw.toFixed(2)} MW` : ""}
+          note={
+            kpis.is_dispatched
+              ? `Redusă de la ${nf(kpis.raw_injection_mw)} MW prin dispecerizare`
+              : `Limită linie ${nf(limit, 0)} MW · prognoză ${nf(kpis.predicted_injection_mw)} MW`
+          }
+        />
+        <MetricCard
+          label="Surplus peste limită"
+          value={`+${nf(kpis.actual_surplus_mw)}`}
+          unit="MW"
+          tone={surplusTone}
+          note={`Radiație ${nf(kpis.solar_irradiance_wm2, 0)} W/m² · ${nf(kpis.ambient_temp_c, 1)} °C`}
+        />
+        <MetricCard
+          label="Preț piață (PZU)"
+          value={nf(kpis.day_ahead_price_eur)}
+          unit="€/MWh"
+          note={`Arbitraj posibil sub ${nf(explainability.max_pzu_price_eur, 0)} €/MWh`}
+        />
+        <MetricCard
+          label="Venit cumulat PPC"
+          value={nf(kpis.cumulative_profit_eur)}
+          unit="€"
+          tone={kpis.cumulative_profit_eur > 0 ? "success" : "neutral"}
+          note={`${nf(kpis.cumulative_mwh)} MWh vânduți · ora curentă +${nf(kpis.revenue_eur)} €`}
+        />
+      </div>
+
+      <Card
+        title="Injecție în rețea"
+        subtitle="Ultimele 24 de ore măsurate și prognoza modelului pentru următoarele 2 ore"
+      >
+        {hovered && (
+          <div className="chart-readout">
+            <span>
+              Ora <strong>{hovered.short_time}</strong>
             </span>
-          )}
-        </div>
+            <span>
+              Măsurat:{" "}
+              <strong>
+                {hovered.real_injection_mw !== null ? `${nf(hovered.real_injection_mw)} MW` : "—"}
+              </strong>
+            </span>
+            <span>
+              Prognoză: <strong>{nf(hovered.predicted_injection_mw)} MW</strong>
+            </span>
+            {hovered.delivered_mw > 0.01 && (
+              <span>
+                Livrat către data centre: <strong>{nf(hovered.delivered_mw)} MW</strong>
+              </span>
+            )}
+          </div>
+        )}
 
         <svg
-          viewBox={`0 0 ${width} ${height}`}
-          style={{ width: "100%", height: "auto", display: "block", overflow: "visible" }}
+          className="chart-svg"
+          viewBox={`0 0 ${W} ${H}`}
           onMouseLeave={() => setHoverIdx(null)}
+          role="img"
+          aria-label="Grafic injecție în rețea"
         >
-          {/* Horizontal grid lines */}
-          {[0, 4, 8, 10, 12, 16].map((val) => {
-            const y = yOf(val);
-            const isLimit = val === 10;
-            return (
-              <g key={val}>
-                <line
-                  x1={padLeft}
-                  y1={y}
-                  x2={width - padRight}
-                  y2={y}
-                  stroke={isLimit ? "#FF4B4B" : "rgba(255,255,255,0.07)"}
-                  strokeWidth={isLimit ? 1.8 : 1}
-                  strokeDasharray={isLimit ? "6 4" : undefined}
-                />
-                <text
-                  x={padLeft - 8}
-                  y={y + 4}
-                  textAnchor="end"
-                  fill={isLimit ? "#FF7B7B" : "#8E95A5"}
-                  fontSize="10"
-                  fontFamily="JetBrains Mono, monospace"
-                >
-                  {val} MW
-                </text>
-              </g>
-            );
-          })}
+          {ticks.map((t) => (
+            <g key={t}>
+              <line x1={PAD.l} x2={W - PAD.r} y1={yOf(t)} y2={yOf(t)} stroke="#222c3a" strokeWidth={1} />
+              <text x={PAD.l - 8} y={yOf(t) + 4} textAnchor="end" fill="#70809a" fontSize="11">
+                {t}
+              </text>
+            </g>
+          ))}
 
-          {/* Highlight area above 10 MW */}
+          {/* Limita liniei */}
+          <line
+            x1={PAD.l}
+            x2={W - PAD.r}
+            y1={limitY}
+            y2={limitY}
+            stroke="#ea5a5f"
+            strokeWidth={1.4}
+            strokeDasharray="6 4"
+          />
+          <text x={PAD.l - 8} y={limitY + 4} textAnchor="end" fill="#ea5a5f" fontSize="11" fontWeight="600">
+            {nf(limit, 0)}
+          </text>
+          <text x={W - PAD.r} y={limitY - 6} textAnchor="end" fill="#ea5a5f" fontSize="11">
+            Limită linie
+          </text>
+
+          {/* Zona de depășire */}
           {chartPoints.map((pt, i) => {
             if (i === 0) return null;
             const prev = chartPoints[i - 1];
             const v1 = pt.after_dispatch_mw ?? pt.real_injection_mw ?? pt.predicted_injection_mw;
             const v0 = prev.after_dispatch_mw ?? prev.real_injection_mw ?? prev.predicted_injection_mw;
-            if (v1 <= kpis.grid_limit_mw && v0 <= kpis.grid_limit_mw) return null;
-            const x0 = xOf(i - 1);
-            const x1 = xOf(i);
-            const y0 = yOf(Math.max(kpis.grid_limit_mw, v0));
-            const y1 = yOf(Math.max(kpis.grid_limit_mw, v1));
-            const isSaved = pt.delivered_mw > 0.01;
+            if (v1 <= limit && v0 <= limit) return null;
+            const saved = pt.delivered_mw > 0.01;
             return (
               <polygon
-                key={`fill-${i}`}
-                points={`${x0},${limitY} ${x0},${y0} ${x1},${y1} ${x1},${limitY}`}
-                fill={isSaved ? "rgba(0, 255, 157, 0.22)" : "rgba(255, 75, 75, 0.25)"}
+                key={`ovl-${i}`}
+                points={`${xOf(i - 1)},${limitY} ${xOf(i - 1)},${yOf(Math.max(limit, v0))} ${xOf(i)},${yOf(Math.max(limit, v1))} ${xOf(i)},${limitY}`}
+                fill={saved ? "rgba(47,178,125,0.2)" : "rgba(234,90,95,0.22)"}
               />
             );
           })}
 
-          {/* Vertical marker NOW (T) */}
-          {currentIdx >= 0 && (
+          {/* Marcaj „acum” */}
+          {nowIdx >= 0 && (
             <g>
               <line
-                x1={xOf(currentIdx)}
-                y1={padTop}
-                x2={xOf(currentIdx)}
-                y2={height - padBottom}
-                stroke="#00FF9D"
-                strokeWidth={1.5}
+                x1={xOf(nowIdx)}
+                x2={xOf(nowIdx)}
+                y1={PAD.t}
+                y2={H - PAD.b}
+                stroke="#70809a"
                 strokeDasharray="3 3"
               />
-              <text
-                x={xOf(currentIdx)}
-                y={padTop - 7}
-                textAnchor="middle"
-                fill="#00FF9D"
-                fontSize="10"
-                fontWeight="700"
-                fontFamily="JetBrains Mono, monospace"
-              >
-                ACUM ({timeline.current_hour_str})
+              <text x={xOf(nowIdx)} y={PAD.t - 3} textAnchor="middle" fill="#a3afc0" fontSize="11" fontWeight="600">
+                Acum
               </text>
             </g>
           )}
 
-          {/* AI Predicted Injection Line */}
-          <path
-            d={predPath}
-            fill="none"
-            stroke="#38BDF8"
-            strokeWidth={2.2}
-            strokeDasharray="5 3"
-          />
+          <path d={forecastPath} fill="none" stroke="#4c8dff" strokeWidth={2} strokeDasharray="5 4" />
+          <path d={measuredPath} fill="none" stroke="#e8ecf2" strokeWidth={2.2} />
 
-          {/* Real Injection Line */}
-          <path d={realPath} fill="none" stroke="#FFFFFF" strokeWidth={2.4} />
-
-          {/* Points & Post-Dispatch Green Markers */}
           {chartPoints.map((pt, i) => {
             const cx = xOf(i);
             const cy = yOf(pt.real_injection_mw ?? pt.predicted_injection_mw);
@@ -261,49 +259,27 @@ export const PpcDispatchPanel: React.FC<PpcDispatchPanelProps> = ({
               <g key={pt.v_idx}>
                 {pt.after_dispatch_mw !== null && (
                   <>
-                    <line
-                      x1={cx}
-                      y1={cy}
-                      x2={cx}
-                      y2={yOf(pt.after_dispatch_mw)}
-                      stroke="#00FF9D"
-                      strokeWidth={2.2}
-                    />
-                    <circle
-                      cx={cx}
-                      cy={yOf(pt.after_dispatch_mw)}
-                      r={5}
-                      fill="#00FF9D"
-                      stroke="#0c0d12"
-                      strokeWidth={1.5}
-                    />
+                    <line x1={cx} x2={cx} y1={cy} y2={yOf(pt.after_dispatch_mw)} stroke="#2fb27d" strokeWidth={2} />
+                    <circle cx={cx} cy={yOf(pt.after_dispatch_mw)} r={4} fill="#2fb27d" />
                   </>
                 )}
                 <circle
                   cx={cx}
                   cy={cy}
-                  r={pt.is_current ? 5.5 : pt.is_future ? 4 : 3}
-                  fill={pt.is_future ? "#38BDF8" : pt.is_current ? "#00FF9D" : "#FFFFFF"}
+                  r={pt.is_current ? 4.5 : 2.5}
+                  fill={pt.is_future ? "#4c8dff" : "#e8ecf2"}
                 />
                 {i % 4 === 0 && (
-                  <text
-                    x={cx}
-                    y={height - 12}
-                    textAnchor="middle"
-                    fill="#8E95A5"
-                    fontSize="10"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
+                  <text x={cx} y={H - 8} textAnchor="middle" fill="#70809a" fontSize="11">
                     {pt.short_time}
                   </text>
                 )}
                 <rect
-                  x={cx - plotW / nPts / 2}
-                  y={padTop}
-                  width={plotW / nPts}
+                  x={cx - plotW / n / 2}
+                  y={PAD.t}
+                  width={plotW / n}
                   height={plotH}
                   fill="transparent"
-                  style={{ cursor: "crosshair" }}
                   onMouseEnter={() => setHoverIdx(i)}
                 />
               </g>
@@ -311,81 +287,66 @@ export const PpcDispatchPanel: React.FC<PpcDispatchPanelProps> = ({
           })}
         </svg>
 
-        <div
-          style={{
-            display: "flex",
-            gap: 18,
-            marginTop: 8,
-            fontFamily: "var(--font-mono)",
-            fontSize: "0.73rem",
-            color: "#8E95A5",
-            flexWrap: "wrap",
-          }}
+        <div className="legend">
+          <span className="legend-item" style={{ color: "#e8ecf2" }}>
+            <span className="swatch" /> Injecție măsurată
+          </span>
+          <span className="legend-item" style={{ color: "#4c8dff" }}>
+            <span className="swatch dashed" /> Prognoză model
+          </span>
+          <span className="legend-item" style={{ color: "#ea5a5f" }}>
+            <span className="swatch dashed" /> Limită linie
+          </span>
+          <span className="legend-item" style={{ color: "#2fb27d" }}>
+            <span className="swatch box" /> Injecție după dispecerizare
+          </span>
+        </div>
+      </Card>
+
+      <div className="grid-2">
+        <Card title="Recomandarea sistemului" subtitle={`Situația la ora ${timeline.current_hour_str}`}>
+          <p className="reasoning">{explainability.copilot_reasoning}</p>
+          <ul className="checks">
+            {checks.map((c, idx) => (
+              <li key={idx} className={`check ${c.ok ? "ok" : "fail"}`}>
+                <span className="check-mark">{c.ok ? "✓" : "✕"}</span>
+                <span>{c.text}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="hint">O ofertă se generează doar când toate condițiile sunt îndeplinite.</p>
+        </Card>
+
+        <Card
+          title="De ce prezice modelul acest surplus"
+          subtitle="Contribuția fiecărui factor la prognoză (TreeSHAP)"
         >
-          <span>⚪ Linia Albă: Injecție Reală Măsurată (MW)</span>
-          <span style={{ color: "#38BDF8" }}>🔵 Linia Punctată: Predicție AI XGBoost (T+2h)</span>
-          <span style={{ color: "#FF7B7B" }}>🔴 Plafon Linie PPC ({kpis.grid_limit_mw.toFixed(0)} MW)</span>
-          <span style={{ color: "#00FF9D" }}>🟢 Puncte Verzi: Curent Redus după Alocarea către Data Centre</span>
-        </div>
-      </div>
-
-      {/* AI Copilot Reasoning + TreeSHAP Explainability */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "1fr 1fr",
-          gap: 12,
-        }}
-      >
-        <div className="vc-card" style={{ marginBottom: 0 }}>
-          <div className="vc-modal-head">🤖 VOLTCOMPUTE COPILOT // JUSTIFICARE DECIZIE</div>
-          <div className="vc-modal-body" style={{ fontSize: "0.83rem" }}>
-            {explainability.copilot_reasoning}
-          </div>
-          <div
-            style={{
-              marginTop: 10,
-              paddingTop: 8,
-              borderTop: "1px solid rgba(255,255,255,0.07)",
-              fontFamily: "var(--font-mono)",
-              fontSize: "0.73rem",
-              color: "#8E95A5",
-            }}
-          >
-            Reguli active: Surplus &gt; {explainability.min_surplus_threshold_mw} MW · PZU &lt;{" "}
-            {explainability.max_pzu_price_eur} €/MWh · Confidență ≥{" "}
-            {(explainability.confidence_threshold * 100).toFixed(0)}%
-          </div>
-        </div>
-
-        <div className="vc-card" style={{ marginBottom: 0 }}>
-          <div className="vc-modal-head">📊 EXPLICABILITATE MODEL // TREESHAP EXACT (MW)</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {shapEntries.map(([feat, val]) => {
-              const pct = Math.min(100, (Math.abs(val) / maxShap) * 100);
-              const isPos = val >= 0;
+          <div className="shap">
+            {shap.map(([feature, value]) => {
+              const pct = Math.min(50, (Math.abs(value) / maxShap) * 50);
+              const positive = value >= 0;
               return (
-                <div key={feat} style={{ fontFamily: "var(--font-mono)", fontSize: "0.73rem" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-                    <span style={{ color: "#D1D5DB" }}>{FEATURE_LABELS[feat] ?? feat}</span>
-                    <span style={{ color: isPos ? "#00FF9D" : "#38BDF8", fontWeight: 700 }}>
-                      {isPos ? `+${val.toFixed(2)}` : val.toFixed(2)} MW
+                <div key={feature}>
+                  <div className="shap-head">
+                    <span className="shap-name">{FEATURE_LABELS[feature] ?? feature}</span>
+                    <span className="shap-val">
+                      {positive ? "+" : "−"}
+                      {nf(Math.abs(value))} MW
                     </span>
                   </div>
-                  <div className="vc-bar-bg" style={{ margin: 0, height: 5 }}>
-                    <div
-                      style={{
-                        width: `${pct}%`,
-                        height: "100%",
-                        background: isPos ? "#00FF9D" : "#38BDF8",
-                      }}
+                  <div className="shap-track">
+                    <span className="shap-mid" />
+                    <span
+                      className={`shap-bar ${positive ? "shap-pos" : "shap-neg"}`}
+                      style={{ width: `${pct}%` }}
                     />
                   </div>
                 </div>
               );
             })}
           </div>
-        </div>
+          <p className="hint">Albastru: crește surplusul prognozat · Gri: îl scade.</p>
+        </Card>
       </div>
     </div>
   );

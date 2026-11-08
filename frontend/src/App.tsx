@@ -6,14 +6,15 @@ import {
   resetOffers,
 } from "./api/client";
 import { DataCenterPanel } from "./components/DataCenterPanel";
-import { HeaderBar } from "./components/HeaderBar";
+import { HeaderBar, ViewId } from "./components/HeaderBar";
 import { PpcDispatchPanel } from "./components/PpcDispatchPanel";
 import { ScadaMapPanel } from "./components/ScadaMapPanel";
+import { StatusBanner } from "./components/StatusBanner";
 import { DashboardStateResponse } from "./types/telemetry";
 
 export const App: React.FC = () => {
   const [state, setState] = useState<DashboardStateResponse | null>(null);
-  const [activeView, setActiveView] = useState<"console" | "map">("console");
+  const [activeView, setActiveView] = useState<ViewId>("console");
   const [autoplay, setAutoplay] = useState<boolean>(false);
   const [busy, setBusy] = useState<boolean>(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -23,9 +24,7 @@ export const App: React.FC = () => {
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
-    window.setTimeout(() => {
-      setToast((prev) => (prev === msg ? null : prev));
-    }, 3600);
+    window.setTimeout(() => setToast((prev) => (prev === msg ? null : prev)), 4000);
   }, []);
 
   const loadStep = useCallback(
@@ -41,12 +40,12 @@ export const App: React.FC = () => {
             lastAutopauseOfferRef.current = offerKey;
             setAutoplay(false);
             showToast(
-              `⏸ Live Feed oprit: oferta către ${data.offer_state.offer.node_short} așteaptă Aprobă / Refuză.`
+              `Redarea s-a oprit: ${data.offer_state.offer.node_short} are o ofertă care așteaptă decizia dumneavoastră.`
             );
           }
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Eroare conexiune API");
+        setError(err instanceof Error ? err.message : "Eroare de conexiune la server");
         setAutoplay(false);
       }
     },
@@ -57,7 +56,7 @@ export const App: React.FC = () => {
     void loadStep();
   }, [loadStep]);
 
-  // Autoplay loop (1s interval, continuous monthly ring buffer)
+  // Redare automată: o oră la fiecare secundă, continuu de la o lună la alta
   useEffect(() => {
     if (!autoplay || !state) return;
     const timer = window.setTimeout(() => {
@@ -76,8 +75,8 @@ export const App: React.FC = () => {
     setAutoplay(false);
     const prv = state.timeline.current_step - 1;
     if (prv < 0) {
-      const prevCycle = state.timeline.ring_cycle - 1;
-      void loadStep(9999, prevCycle);
+      // serverul limitează pasul la ultima oră a lunii precedente
+      void loadStep(9999, state.timeline.ring_cycle - 1);
     } else {
       void loadStep(prv, state.timeline.ring_cycle);
     }
@@ -100,101 +99,78 @@ export const App: React.FC = () => {
     void loadStep(newStep, state.timeline.ring_cycle);
   };
 
-  const handleAccept = async () => {
-    if (!state || !state.offer_state.offer) return;
+  const runAction = async (
+    action: () => Promise<DashboardStateResponse>,
+    fallbackError: string
+  ) => {
     setBusy(true);
     try {
-      const updated = await acceptOffer(
-        state.offer_state.offer.node_id,
-        state.offer_state.offer.per_step,
-        state.timeline.current_step,
-        state.timeline.ring_cycle
-      );
+      const updated = await action();
       setState(updated);
-      if (updated.toast) showToast(`✅ ${updated.toast}`);
+      if (updated.toast) showToast(updated.toast);
     } catch (err) {
-      showToast(err instanceof Error ? err.message : "Eroare la aprobare");
+      showToast(err instanceof Error ? err.message : fallbackError);
     } finally {
       setBusy(false);
     }
   };
 
-  const handleRefuse = async () => {
-    if (!state || !state.offer_state.offer) return;
-    setBusy(true);
-    try {
-      const updated = await refuseOffer(
-        state.offer_state.offer.node_id,
-        state.offer_state.offer.steps,
-        state.timeline.current_step,
-        state.timeline.ring_cycle
-      );
-      setState(updated);
-      if (updated.toast) showToast(`⛔ ${updated.toast}`);
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Eroare la refuz");
-    } finally {
-      setBusy(false);
-    }
+  const handleAccept = () => {
+    const offer = state?.offer_state.offer;
+    if (!state || !offer) return;
+    void runAction(
+      () => acceptOffer(offer.node_id, offer.per_step, state.timeline.current_step, state.timeline.ring_cycle),
+      "Aprobarea ofertei a eșuat"
+    );
   };
 
-  const handleReset = async () => {
+  const handleRefuse = () => {
+    const offer = state?.offer_state.offer;
+    if (!state || !offer) return;
+    void runAction(
+      () => refuseOffer(offer.node_id, offer.steps, state.timeline.current_step, state.timeline.ring_cycle),
+      "Refuzarea ofertei a eșuat"
+    );
+  };
+
+  const handleReset = () => {
     if (!state) return;
-    const stepsToReset =
+    const steps =
       state.offer_state.offer_steps.length > 0
         ? state.offer_state.offer_steps
         : state.offer_state.table_steps;
-    setBusy(true);
-    try {
-      const updated = await resetOffers(
-        stepsToReset,
-        state.timeline.current_step,
-        state.timeline.ring_cycle
-      );
-      setState(updated);
-      if (updated.toast) showToast(`↩️ ${updated.toast}`);
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Eroare la resetare");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (error && !state) {
-    return (
-      <div className="vc-container">
-        <div className="vc-alert vc-alert-red">
-          ⚠️ Eroare conectare la backend-ul FastAPI: {error}. Asigură-te că serverul rulează pe{" "}
-          <code>uvicorn server:app --port 8000</code>.
-        </div>
-      </div>
+    void runAction(
+      () => resetOffers(steps, state.timeline.current_step, state.timeline.ring_cycle),
+      "Resetarea alocărilor a eșuat"
     );
-  }
+  };
 
   if (!state) {
     return (
-      <div className="vc-container">
-        <div className="vc-sub" style={{ paddingTop: 24 }}>
-          ⚡ Se încarcă telemetria SCADA și modelul XGBoost...
+      <div className="app-shell">
+        <div className="state-screen">
+          {error ? (
+            <>
+              <strong style={{ color: "var(--danger)" }}>Nu mă pot conecta la server.</strong>
+              <p style={{ marginTop: 8 }}>{error}</p>
+              <p className="hint">Verificați că backend-ul rulează (uvicorn server:app).</p>
+            </>
+          ) : (
+            "Se încarcă datele de telemetrie și modelul de prognoză…"
+          )}
         </div>
       </div>
     );
   }
 
-  const alertClass =
-    state.banner.level === "red"
-      ? "vc-alert vc-alert-red"
-      : state.banner.level === "amber"
-      ? "vc-alert vc-alert-amber"
-      : "vc-alert vc-alert-green";
-
   return (
-    <div className="vc-container">
+    <div className="app-shell">
       <HeaderBar
         timeline={state.timeline}
         liveMae={state.kpis.live_window_mae}
         activeView={activeView}
         autoplay={autoplay}
+        connected={error === null}
         onSelectView={setActiveView}
         onStepBack={handleStepBack}
         onNextHour={handleNextHour}
@@ -202,9 +178,9 @@ export const App: React.FC = () => {
         onSliderChange={handleSliderChange}
       />
 
-      <div className={alertClass}>{state.banner.text}</div>
+      <StatusBanner banner={state.banner} />
 
-      <div className="vc-main-grid">
+      <div className="workspace">
         {activeView === "console" ? (
           <PpcDispatchPanel
             timeline={state.timeline}
@@ -233,7 +209,7 @@ export const App: React.FC = () => {
         />
       </div>
 
-      {toast && <div className="vc-toast">{toast}</div>}
+      {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );
 };

@@ -1,10 +1,10 @@
 import React, { useState } from "react";
-import {
-  DashboardKPIs,
-  DataCenterCard,
-  MapTopology,
-  TimelineInfo,
-} from "../types/telemetry";
+import { nf } from "../lib/format";
+import { DashboardKPIs, DataCenterCard, MapTopology, TimelineInfo } from "../types/telemetry";
+import { STATUS_META } from "./DataCenterPanel";
+import { Card } from "./ui/Card";
+import { MetricCard } from "./ui/MetricCard";
+import { StatusBadge } from "./ui/StatusBadge";
 
 interface ScadaMapPanelProps {
   timeline: TimelineInfo;
@@ -13,355 +13,186 @@ interface ScadaMapPanelProps {
   topology: MapTopology;
 }
 
-// Conturul geografic simplificat al României (lat, lon) pentru fundalul SCADA
 const ROMANIA_BORDER: [number, number][] = [
-  [47.95, 22.88],
-  [48.22, 26.65],
-  [47.25, 27.62],
-  [46.15, 28.12],
-  [45.45, 28.22],
-  [45.2, 29.68],
-  [43.78, 28.58],
-  [43.68, 25.35],
-  [43.82, 22.92],
-  [44.68, 22.15],
-  [45.75, 20.28],
-  [46.62, 21.18],
-  [47.95, 22.88],
+  [47.95, 22.88], [48.22, 26.65], [47.25, 27.62], [46.15, 28.12], [45.45, 28.22],
+  [45.2, 29.68], [43.78, 28.58], [43.68, 25.35], [43.82, 22.92], [44.68, 22.15],
+  [45.75, 20.28], [46.62, 21.18], [47.95, 22.88],
 ];
 
-export const ScadaMapPanel: React.FC<ScadaMapPanelProps> = ({
-  timeline,
-  kpis,
-  datacenters,
-  topology,
-}) => {
+const W = 960;
+const H = 500;
+const LON = { min: 20.0, max: 29.9 };
+const LAT = { min: 43.4, max: 48.4 };
+
+const project = (lat: number, lon: number): [number, number] => [
+  40 + ((lon - LON.min) / (LON.max - LON.min)) * (W - 80),
+  H - 34 - ((lat - LAT.min) / (LAT.max - LAT.min)) * (H - 68),
+];
+
+const toPath = (coords: [number, number][]) =>
+  coords
+    .map(([lat, lon], i) => {
+      const [x, y] = project(lat, lon);
+      return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+
+export const ScadaMapPanel: React.FC<ScadaMapPanelProps> = ({ kpis, datacenters, topology }) => {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-
-  const width = 920;
-  const height = 540;
-
-  // Proiecție Mercator locală pe România (lon: 20.0 -> 29.9, lat: 43.4 -> 48.4)
-  const lonMin = 20.0;
-  const lonMax = 29.9;
-  const latMin = 43.4;
-  const latMax = 48.4;
-
-  const project = (lat: number, lon: number): [number, number] => {
-    const x = 45 + ((lon - lonMin) / (lonMax - lonMin)) * (width - 90);
-    const y = height - 40 - ((lat - latMin) / (latMax - latMin)) * (height - 80);
-    return [x, y];
-  };
-
-  const toSvgPath = (coords: [number, number][]) =>
-    coords
-      .map(([lat, lon], idx) => {
-        const [x, y] = project(lat, lon);
-        return `${idx === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
-      })
-      .join(" ");
-
-  const [solarX, solarY] = project(topology.solar_park.lat, topology.solar_park.lon);
-  const selectedDc = datacenters.find((d) => d.id === selectedId) ?? datacenters[0];
+  const selected = datacenters.find((d) => d.id === selectedId) ?? datacenters[0];
+  const [sx, sy] = project(topology.solar_park.lat, topology.solar_park.lon);
+  const overLimit = kpis.actual_injection_mw > kpis.grid_limit_mw;
 
   return (
-    <div>
-      <div className="vc-pane-head vc-pane-ppc">
-        HARTA NAȚIONALĂ SCADA 400 kV // FLUX ENERGETIC PPC → DATA CENTRES
-      </div>
-      <div className="vc-pane-sub">
-        Topologie magistrală 400 kV Transelectrica și rutare live a surplusului solar către
-        clusterele AI/HPC
-      </div>
-
-      {/* Top KPI Summary Bar */}
-      <div className="vc-kpi-grid">
-        <div className="vc-metric-card">
-          <div className="vc-metric-label">Producție Parc Solar PPC</div>
-          <div className="vc-metric-value">{kpis.raw_injection_mw.toFixed(2)} MW</div>
-          <div className="vc-metric-delta" style={{ color: "#8E95A5" }}>
-            Muntenia Sud · {kpis.solar_irradiance_wm2.toFixed(0)} W/m²
-          </div>
-        </div>
-
-        <div className="vc-metric-card">
-          <div className="vc-metric-label">Curent în Magistrala PPC</div>
-          <div className="vc-metric-value">{kpis.actual_injection_mw.toFixed(2)} MW</div>
-          <div
-            className="vc-metric-delta"
-            style={{
-              color:
-                kpis.actual_injection_mw > kpis.grid_limit_mw ? "#FF7B7B" : "#00FF9D",
-            }}
-          >
-            Plafon termic linie: {kpis.grid_limit_mw.toFixed(0)} MW
-          </div>
-        </div>
-
-        <div className="vc-metric-card">
-          <div className="vc-metric-label">Flux Rutat spre Data Centre</div>
-          <div className="vc-metric-value" style={{ color: "#00FF9D" }}>
-            {kpis.delivered_mw.toFixed(2)} MW
-          </div>
-          <div className="vc-metric-delta" style={{ color: "#38BDF8" }}>
-            Tarif fix garantat: 30 €/MWh
-          </div>
-        </div>
-
-        <div className="vc-metric-card">
-          <div className="vc-metric-label">Echivalent AI Compute</div>
-          <div className="vc-metric-value" style={{ color: "#38BDF8" }}>
-            {kpis.ai_tokens_millions.toFixed(1)}M Tokens
-          </div>
-          <div className="vc-metric-delta" style={{ color: "#00FF9D" }}>
-            🌱 {kpis.co2_saved_tons.toFixed(2)}t CO₂ evitate
-          </div>
-        </div>
+    <div className="stack">
+      <div className="kpi-grid">
+        <MetricCard
+          label="Producție parc solar"
+          value={nf(kpis.raw_injection_mw)}
+          unit="MW"
+          note={`Muntenia Sud · ${nf(kpis.solar_irradiance_wm2, 0)} W/m²`}
+        />
+        <MetricCard
+          label="Curent în linia de 400 kV"
+          value={nf(kpis.actual_injection_mw)}
+          unit="MW"
+          tone={overLimit ? "danger" : "neutral"}
+          meter={{ value: kpis.actual_injection_mw, max: kpis.grid_limit_mw, tone: overLimit ? "danger" : "info" }}
+          note={`Limită linie ${nf(kpis.grid_limit_mw, 0)} MW`}
+        />
+        <MetricCard
+          label="Energie rutată către data centre"
+          value={nf(kpis.delivered_mw)}
+          unit="MW"
+          tone={kpis.delivered_mw > 0.01 ? "success" : "neutral"}
+          note="Tarif fix 30 €/MWh"
+        />
+        <MetricCard
+          label="CO₂ evitat (cumulat)"
+          value={nf(kpis.co2_saved_tons)}
+          unit="tone"
+          note={`≈ ${nf(kpis.ai_tokens_millions, 1)} mil. tokeni AI alimentați cu energie verde`}
+        />
       </div>
 
-      {/* Geospatial SCADA Map Canvas */}
-      <div className="vc-card" style={{ padding: 12 }}>
-        <svg
-          viewBox={`0 0 ${width} ${height}`}
-          style={{
-            width: "100%",
-            height: "auto",
-            background: "radial-gradient(circle at 50% 50%, #131824 0%, #0a0c10 100%)",
-            borderRadius: 10,
-            border: "1px solid rgba(255,255,255,0.08)",
-            display: "block",
-          }}
-        >
-          {/* Coordinate Grid */}
-          {[44, 45, 46, 47, 48].map((lat) => {
-            const [, y] = project(lat, 25);
-            return (
-              <g key={`lat-${lat}`}>
-                <line
-                  x1={0}
-                  y1={y}
-                  x2={width}
-                  y2={y}
-                  stroke="rgba(56, 189, 248, 0.06)"
-                  strokeWidth={1}
-                />
-                <text
-                  x={12}
-                  y={y - 4}
-                  fill="rgba(142,149,165,0.45)"
-                  fontSize="9"
-                  fontFamily="JetBrains Mono, monospace"
-                >
-                  {lat}°N
-                </text>
-              </g>
-            );
-          })}
-          {[21, 23, 25, 27, 29].map((lon) => {
-            const [x] = project(45, lon);
-            return (
-              <g key={`lon-${lon}`}>
-                <line
-                  x1={x}
-                  y1={0}
-                  x2={x}
-                  y2={height}
-                  stroke="rgba(56, 189, 248, 0.06)"
-                  strokeWidth={1}
-                />
-                <text
-                  x={x + 4}
-                  y={height - 10}
-                  fill="rgba(142,149,165,0.45)"
-                  fontSize="9"
-                  fontFamily="JetBrains Mono, monospace"
-                >
-                  {lon}°E
-                </text>
-              </g>
-            );
-          })}
-
-          {/* Romania Border Contour */}
-          <path
-            d={toSvgPath(ROMANIA_BORDER)}
-            fill="rgba(30, 41, 59, 0.28)"
-            stroke="rgba(148, 163, 184, 0.25)"
-            strokeWidth={1.5}
-          />
-
-          {/* 400 kV National Backbone Ring */}
-          <path
-            d={toSvgPath(topology.backbone_400kv)}
-            fill="none"
-            stroke="rgba(148, 163, 184, 0.28)"
-            strokeWidth={2}
-            strokeDasharray="4 4"
-          />
-
-          {/* Dedicated Power Corridors from PPC Solar Park to each Data Center */}
-          {datacenters.map((dc) => {
-            const pathD = toSvgPath(dc.waypoints);
-            const isAccepted = dc.status === "ACCEPTED" || dc.allocated_mwh > 0.01;
-            const isPending = dc.status === "OFFER_PENDING";
-            const isRejected =
-              dc.status === "REJECTED_THERMAL_SAFETY" || dc.status === "REFUSED";
-
-            const strokeColor = isAccepted
-              ? "#00FF9D"
-              : isPending
-              ? "#F59E0B"
-              : isRejected
-              ? "rgba(255, 75, 75, 0.45)"
-              : "rgba(56, 189, 248, 0.28)";
-
-            return (
-              <g key={`corridor-${dc.id}`}>
-                {/* Base corridor */}
-                <path
-                  d={pathD}
-                  fill="none"
-                  stroke={strokeColor}
-                  strokeWidth={isAccepted ? 5 : isPending ? 3.5 : 2}
-                  opacity={isAccepted ? 0.3 : 0.7}
-                />
-                {/* Animated power flow overlay when active or pending */}
-                {(isAccepted || isPending) && (
-                  <path
-                    d={pathD}
-                    fill="none"
-                    stroke={isAccepted ? "#00FF9D" : "#F59E0B"}
-                    strokeWidth={3}
-                    className="vc-power-flow-active"
-                  />
-                )}
-              </g>
-            );
-          })}
-
-          {/* PPC Solar Park Node (Muntenia Sud) */}
-          <g transform={`translate(${solarX}, ${solarY})`}>
-            <circle r={18} fill="rgba(250, 204, 21, 0.18)" />
-            <circle
-              r={10}
-              fill="#FACC15"
-              stroke="#0c0d12"
-              strokeWidth={2}
+      <Card
+        title="Harta rețelei de transport"
+        subtitle="Magistrala de 400 kV și rutele către data centre. Click pe un nod pentru detalii."
+      >
+        <div className="map-wrap">
+          <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+            <path d={toPath(ROMANIA_BORDER)} fill="#121923" stroke="#2a3649" strokeWidth={1.2} />
+            <path
+              d={toPath(topology.backbone_400kv)}
+              fill="none"
+              stroke="#34425a"
+              strokeWidth={1.5}
+              strokeDasharray="4 5"
             />
-            <text
-              x={0}
-              y={28}
-              textAnchor="middle"
-              fill="#FACC15"
-              fontSize="11"
-              fontWeight="700"
-              fontFamily="JetBrains Mono, monospace"
-            >
-              ☀️ {topology.solar_park.short}
-            </text>
-            <text
-              x={0}
-              y={42}
-              textAnchor="middle"
-              fill="#E5E7EB"
-              fontSize="10"
-              fontFamily="JetBrains Mono, monospace"
-            >
-              Injecție: {kpis.raw_injection_mw.toFixed(2)} MW
-            </text>
-          </g>
 
-          {/* Data Center Nodes */}
-          {datacenters.map((dc) => {
-            const [x, y] = project(dc.lat, dc.lon);
-            const isAccepted = dc.status === "ACCEPTED" || dc.allocated_mwh > 0.01;
-            const isPending = dc.status === "OFFER_PENDING";
-            const isBlocked = dc.status === "REJECTED_THERMAL_SAFETY";
-            const nodeColor = isAccepted
-              ? "#00FF9D"
-              : isPending
-              ? "#F59E0B"
-              : isBlocked
-              ? "#FF4B4B"
-              : dc.color;
+            {datacenters.map((dc) => {
+              const d = toPath(dc.waypoints);
+              const active = dc.status === "ACCEPTED" || dc.allocated_mwh > 0.01;
+              const pending = dc.status === "OFFER_PENDING";
+              const blocked = dc.status === "REJECTED_THERMAL_SAFETY" || dc.status === "REFUSED";
+              const color = active ? "#2fb27d" : pending ? "#e3a634" : blocked ? "#6e3236" : "#34425a";
+              return (
+                <g key={`route-${dc.id}`}>
+                  <path d={d} fill="none" stroke={color} strokeWidth={active ? 3 : 1.8} />
+                  {(active || pending) && (
+                    <path
+                      d={d}
+                      fill="none"
+                      stroke={active ? "#6fd4a8" : "#f0c566"}
+                      strokeWidth={2}
+                      className="flow-line"
+                    />
+                  )}
+                </g>
+              );
+            })}
 
-            return (
-              <g
-                key={dc.id}
-                transform={`translate(${x}, ${y})`}
-                style={{ cursor: "pointer" }}
-                onClick={() => setSelectedId(dc.id)}
-              >
-                <circle
-                  r={isAccepted || isPending ? 20 : 14}
-                  fill={nodeColor}
-                  opacity={0.18}
-                />
-                <circle
-                  r={9}
-                  fill={nodeColor}
-                  stroke="#0c0d12"
-                  strokeWidth={2}
-                />
-                <text
-                  x={0}
-                  y={-15}
-                  textAnchor="middle"
-                  fill="#FFFFFF"
-                  fontSize="11"
-                  fontWeight="700"
-                  fontFamily="JetBrains Mono, monospace"
+            <g transform={`translate(${sx}, ${sy})`}>
+              <circle r={11} fill="#151b24" stroke="#e3a634" strokeWidth={2.5} />
+              <circle r={4} fill="#e3a634" />
+              <text y={28} textAnchor="middle" fill="#e8ecf2" fontSize="12" fontWeight="600">
+                {topology.solar_park.short}
+              </text>
+              <text y={43} textAnchor="middle" fill="#a3afc0" fontSize="11">
+                {nf(kpis.raw_injection_mw)} MW produși
+              </text>
+            </g>
+
+            {datacenters.map((dc) => {
+              const [x, y] = project(dc.lat, dc.lon);
+              const active = dc.status === "ACCEPTED" || dc.allocated_mwh > 0.01;
+              const pending = dc.status === "OFFER_PENDING";
+              const blocked = dc.status === "REJECTED_THERMAL_SAFETY";
+              const color = active ? "#2fb27d" : pending ? "#e3a634" : blocked ? "#ea5a5f" : "#70809a";
+              const isSel = dc.id === selected?.id;
+              return (
+                <g
+                  key={dc.id}
+                  transform={`translate(${x}, ${y})`}
+                  style={{ cursor: "pointer" }}
+                  onClick={() => setSelectedId(dc.id)}
                 >
-                  #{dc.rank} {dc.short} ({(dc.match_score * 100).toFixed(0)}%)
-                </text>
-                <text
-                  x={0}
-                  y={23}
-                  textAnchor="middle"
-                  fill={nodeColor}
-                  fontSize="10"
-                  fontWeight="600"
-                  fontFamily="JetBrains Mono, monospace"
-                >
-                  {isAccepted
-                    ? `🟢 +${dc.allocated_mwh.toFixed(2)} MW [COMPUTING]`
-                    : isPending
-                    ? `🟡 OFERTĂ ACTIVĂ`
-                    : `${dc.temp_c.toFixed(1)}°C · Lib: ${dc.free_capacity_mw.toFixed(1)} MW`}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
+                  {isSel && <circle r={16} fill="none" stroke="#4c8dff" strokeWidth={1.5} />}
+                  <circle r={9} fill="#151b24" stroke={color} strokeWidth={2.5} />
+                  <circle r={3.5} fill={color} />
+                  <text y={-17} textAnchor="middle" fill="#e8ecf2" fontSize="12" fontWeight="600">
+                    {dc.short}
+                  </text>
+                  <text y={26} textAnchor="middle" fill={color} fontSize="11">
+                    {active
+                      ? `+${nf(dc.allocated_mwh)} MWh alocați`
+                      : pending
+                      ? "Ofertă în așteptare"
+                      : `${nf(dc.temp_c, 1)} °C · ${nf(dc.free_capacity_mw, 1)} MW liberi`}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
 
-        {selectedDc && (
-          <div
-            style={{
-              marginTop: 10,
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              fontFamily: "var(--font-mono)",
-              fontSize: "0.76rem",
-              color: "#D1D5DB",
-              flexWrap: "wrap",
-              gap: 8,
-            }}
-          >
+        <div className="legend">
+          <span className="legend-item" style={{ color: "#2fb27d" }}>
+            <span className="swatch" /> Energie rutată
+          </span>
+          <span className="legend-item" style={{ color: "#e3a634" }}>
+            <span className="swatch" /> Ofertă în așteptare
+          </span>
+          <span className="legend-item" style={{ color: "#6e3236" }}>
+            <span className="swatch" /> Refuzat / blocat termic
+          </span>
+          <span className="legend-item" style={{ color: "#34425a" }}>
+            <span className="swatch dashed" /> Magistrala 400 kV
+          </span>
+        </div>
+
+        {selected && (
+          <div className="map-detail">
             <span>
-              📍 <strong>{selectedDc.name}</strong> ({selectedDc.city}) · Job:{" "}
-              <span style={{ color: "#38BDF8" }}>{selectedDc.workload}</span>
+              <strong>{selected.name}</strong> · {selected.city}
             </span>
             <span>
-              HVAC: <strong>{selectedDc.temp_c.toFixed(1)}°C</strong> /{" "}
-              {selectedDc.thermal_limit_c.toFixed(1)}°C · Capacitate liberă:{" "}
-              <strong style={{ color: "#00FF9D" }}>
-                {selectedDc.free_capacity_mw.toFixed(2)} MW
-              </strong>
+              Sarcină: <strong>{selected.workload}</strong>
             </span>
+            <span>
+              Temperatură: <strong>{nf(selected.temp_c, 1)} °C</strong> (max.{" "}
+              {nf(selected.thermal_limit_c, 1)} °C)
+            </span>
+            <span>
+              Capacitate liberă: <strong>{nf(selected.free_capacity_mw)} MW</strong>
+            </span>
+            <StatusBadge
+              tone={(STATUS_META[selected.status] ?? STATUS_META.STANDBY).tone}
+              label={(STATUS_META[selected.status] ?? STATUS_META.STANDBY).label}
+            />
           </div>
         )}
-      </div>
+      </Card>
     </div>
   );
 };
