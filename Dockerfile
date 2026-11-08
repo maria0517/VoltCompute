@@ -1,8 +1,25 @@
+# =====================================================================
+# STAGE 1: Build TypeScript + React Frontend (Vite)
+# =====================================================================
+FROM node:22-alpine AS frontend-builder
+
+WORKDIR /frontend
+
+COPY frontend/package*.json ./
+RUN npm ci || npm install
+
+COPY frontend/ ./
+RUN npm run build
+
+# =====================================================================
+# STAGE 2: Python ML + FastAPI Backend + Static SPA Bundle
+# =====================================================================
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PORT=8501
 
 WORKDIR /app
 
@@ -17,12 +34,15 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
-# Asigură generarea seturilor de date și a modelului antrenat în imagine dacă nu există deja
+# Copiem bundle-ul TypeScript compilat în stage-ul anterior
+COPY --from=frontend-builder /frontend/dist /app/frontend/dist
+
+# Asigură generarea seturilor de date și a modelului antrenat în imagine
 RUN python train.py
 
 EXPOSE 8501 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+    CMD curl --fail http://localhost:8501/health || exit 1
 
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8501"]

@@ -79,3 +79,19 @@ def test_profiles_file_is_valid() -> None:
     assert len(profiles["datacenters"]) >= 3
     for dc in profiles["datacenters"]:
         assert dc["history"]["offers_accepted"] <= dc["history"]["offers_sent"]
+
+
+def test_dashboard_state_service_and_month_continuity() -> None:
+    from services.dashboard_state import DashboardStateService
+
+    svc = DashboardStateService()
+    state0 = svc.get_state(step=37, cycle=0)
+    assert "timeline" in state0
+    assert "kpis" in state0
+    assert "datacenters" in state0
+    assert len(state0["datacenters"]) == 3
+    assert len(state0["chart_points"]) == 27
+
+    state1 = svc.get_state(step=0, cycle=1)
+    assert state1["timeline"]["ring_cycle"] == 1
+    assert state1["timeline"]["month_label"] != state0["timeline"]["month_label"]

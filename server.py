@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -12,6 +12,7 @@ from schemas import (
     GridTelemetry,
     ResearchCenterTelemetry,
 )
+from services.dashboard_state import DashboardStateService
 from services.router import FIXED_TARIFF_EUR_MWH, OfferPool, load_profiles, rank_datacenters
 from simulator import SCENARIO_DESCRIPTIONS, VoltComputeSimulator
 
@@ -34,6 +35,7 @@ app.add_middleware(
 
 agent = VoltComputeAgent()
 simulator = VoltComputeSimulator(agent=agent)
+dashboard_service = DashboardStateService(agent=agent)
 
 # Registru in-memory pentru auditul deciziilor și acțiunilor Human-in-the-Loop
 DECISION_STORE: Dict[str, AgentDecision] = {}
@@ -62,6 +64,26 @@ class EvaluateRequest(BaseModel):
     grid: Dict[str, Any]
     center: Dict[str, Any]
     confidence_override: Optional[float] = None
+
+
+class DashboardAcceptRequest(BaseModel):
+    node_id: str
+    per_step: Dict[int, float]
+    step: int
+    cycle: int = 0
+
+
+class DashboardRefuseRequest(BaseModel):
+    node_id: str
+    steps: List[int]
+    step: int
+    cycle: int = 0
+
+
+class DashboardResetRequest(BaseModel):
+    steps: List[int]
+    step: int
+    cycle: int = 0
 
 
 @app.get("/health")
@@ -99,7 +121,6 @@ def dispatch_decision(action: DispatchAction) -> Dict[str, Any]:
     """
     stored_decision = DECISION_STORE.get(action.decision_id)
     if stored_decision is None:
-        # Dacă decizia provine dintr-o sesiune externă, construim un obiect de bază
         stored_decision = AgentDecision(
             decision_id=action.decision_id,
             surplus_predicted_mw=4.2,
@@ -153,13 +174,11 @@ def run_simulation(scenario_name: str) -> Dict[str, Any]:
     }
 
 
-
 @app.post("/api/router/rank")
 def rank_and_route(payload: RankRequest) -> Dict[str, Any]:
     """
     DECIDE + ACT: clasează Data Center-ele după Match Score (istoric din dc_profiles_and_history.json)
-    și întoarce oferta curentă la tarif fix. Nodurile din `rejected_ids` au refuzat deja
-    (prețul nu scade; oferta sare la următorul nod) -> ALL_DCS_EXHAUSTED dacă nu mai rămâne niciunul.
+    și întoarce oferta curentă la tarif fix.
     """
     history = {dc["id"]: dc["history"] for dc in load_profiles()["datacenters"]}
     candidates = [
@@ -178,3 +197,48 @@ def rank_and_route(payload: RankRequest) -> Dict[str, Any]:
         "current_offer": pool.current_offer(),
         "ranking": pool.ranking,
     }
+
+
+@app.get("/api/dashboard/state")
+def get_dashboard_state(
+    step: Optional[int] = Query(default=None),
+    cycle: int = Query(default=0),
+) -> Dict[str, Any]:
+    """Returnează starea completă SCADA + Harta 400 kV pentru frontend-ul TypeScript."""
+    return dashboard_service.get_state(step=step, cycle=cycle)
+
+
+@app.post("/api/dashboard/offer/accept")
+def accept_dashboard_offer(payload: DashboardAcceptRequest) -> Dict[str, Any]:
+    """Acceptă oferta curentă și returnează starea actualizată."""
+    msg = dashboard_service.accept_offer(payload.node_id, payload.per_step)
+    state = dashboard_service.get_state(step=payload.step, cycle=payload.cycle)
+    state["toast"] = msg
+    return state
+
+
+@app.post("/api/dashboard/offer/refuse")
+def refuse_dashboard_offer(payload: DashboardRefuseRequest) -> Dict[str, Any]:
+    """Refuză oferta curentă (tariful rămâne 30 EUR/MWh, sare la următorul nod) și returnează starea."""
+    msg = dashboard_service.refuse_offer(payload.node_id, payload.steps)
+    state = dashboard_service.get_state(step=payload.step, cycle=payload.cycle)
+    state["toast"] = msg
+    return state
+
+
+@app.post("/api/dashboard/offer/reset")
+def reset_dashboard_offers(payload: DashboardResetRequest) -> Dict[str, Any]:
+    """Resetează ofertele din fereastra curentă și restaurează istoricul DC."""
+    msg = dashboard_service.reset_offers(payload.steps)
+    state = dashboard_service.get_state(step=payload.step, cycle=payload.cycle)
+    state["toast"] = msg
+    return state
+
+
+from pathlib import Path as _Path
+from fastapi.staticfiles import StaticFiles
+
+_FRONTEND_DIST = _Path(__file__).resolve().parent / "frontend" / "dist"
+if _FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
+

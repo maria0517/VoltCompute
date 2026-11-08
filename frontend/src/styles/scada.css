@@ -1,0 +1,412 @@
+:root {
+  --bg-root: #0c0d12;
+  --bg-card: #12141b;
+  --bg-modal: #14161e;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-bright: rgba(255, 255, 255, 0.14);
+  --text-primary: #e5e7eb;
+  --text-white: #ffffff;
+  --text-muted: #8e95a5;
+  --accent-green: #00ff9d;
+  --accent-cyan: #38bdf8;
+  --accent-red: #ff4b4b;
+  --accent-amber: #f59e0b;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  background-color: var(--bg-root);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+.vc-container {
+  max-width: 1760px;
+  margin: 0 auto;
+  padding: 16px 24px 32px 24px;
+}
+
+/* Header & Top Navigation */
+.vc-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.vc-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.vc-title {
+  font-family: var(--font-mono);
+  font-size: 1.2rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--text-white);
+}
+
+.vc-live-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  animation: vcpulse 1.8s infinite;
+}
+
+@keyframes vcpulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(0, 255, 157, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 9px rgba(0, 255, 157, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(0, 255, 157, 0);
+  }
+}
+
+.vc-sub {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.vc-view-tabs {
+  display: flex;
+  gap: 8px;
+}
+
+/* Buttons */
+.vc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 9px 15px;
+  border-radius: 9px;
+  border: 1px solid var(--border-bright);
+  background: #161922;
+  color: var(--text-white);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, transform 0.06s ease;
+  user-select: none;
+}
+
+.vc-btn:hover:not(:disabled) {
+  background: #1e2230;
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.vc-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.vc-btn:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.vc-btn-primary {
+  background: rgba(0, 255, 157, 0.14);
+  border-color: rgba(0, 255, 157, 0.55);
+  color: var(--accent-green);
+}
+
+.vc-btn-primary:hover:not(:disabled) {
+  background: rgba(0, 255, 157, 0.22);
+  border-color: var(--accent-green);
+}
+
+.vc-btn-cyan {
+  background: rgba(56, 189, 248, 0.14);
+  border-color: rgba(56, 189, 248, 0.55);
+  color: var(--accent-cyan);
+}
+
+.vc-btn-cyan:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.22);
+}
+
+.vc-btn-danger {
+  background: rgba(255, 75, 75, 0.14);
+  border-color: rgba(255, 75, 75, 0.55);
+  color: #ff7b7b;
+}
+
+.vc-btn-danger:hover:not(:disabled) {
+  background: rgba(255, 75, 75, 0.24);
+}
+
+/* Timeline Control Bar */
+.vc-timeline-bar {
+  display: grid;
+  grid-template-columns: 140px 230px 180px 1fr;
+  gap: 10px;
+  align-items: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.vc-slider-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 6px;
+}
+
+.vc-slider-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.vc-slider-current {
+  color: var(--accent-green);
+  font-weight: 700;
+}
+
+.vc-range-input {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  outline: none;
+  cursor: pointer;
+}
+
+.vc-range-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  box-shadow: 0 0 10px rgba(0, 255, 157, 0.8);
+  cursor: pointer;
+}
+
+/* Alert Banner */
+.vc-alert {
+  border-radius: 10px;
+  padding: 11px 16px;
+  margin: 6px 0 14px 0;
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.vc-alert-red {
+  background: rgba(255, 75, 75, 0.12);
+  border: 1px solid rgba(255, 75, 75, 0.5);
+  color: #ff7b7b;
+}
+
+.vc-alert-green {
+  background: rgba(0, 255, 157, 0.07);
+  border: 1px solid rgba(0, 255, 157, 0.32);
+  color: var(--accent-green);
+}
+
+.vc-alert-amber {
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  color: var(--accent-amber);
+}
+
+/* Main Split Grid */
+.vc-main-grid {
+  display: grid;
+  grid-template-columns: 65fr 35fr;
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 1200px) {
+  .vc-main-grid {
+    grid-template-columns: 1fr;
+  }
+  .vc-timeline-bar {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.vc-pane-head {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 8px 14px;
+  border-radius: 8px;
+  margin-bottom: 4px;
+}
+
+.vc-pane-ppc {
+  color: var(--accent-green);
+  background: rgba(0, 255, 157, 0.08);
+  border: 1px solid rgba(0, 255, 157, 0.3);
+}
+
+.vc-pane-dc {
+  color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.vc-pane-sub {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin: 0 0 12px 2px;
+}
+
+/* Metric Cards */
+.vc-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.vc-metric-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 12px 15px;
+}
+
+.vc-metric-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.vc-metric-value {
+  font-family: var(--font-mono);
+  font-size: 1.38rem;
+  font-weight: 700;
+  color: var(--text-white);
+}
+
+.vc-metric-delta {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  margin-top: 4px;
+}
+
+/* Cards & Modals */
+.vc-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+
+.vc-modal {
+  background: var(--bg-modal);
+  border: 1px solid var(--border-bright);
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+  margin-bottom: 12px;
+}
+
+.vc-modal-head {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--accent-cyan);
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+
+.vc-modal-title {
+  font-size: 1.02rem;
+  font-weight: 700;
+  color: var(--text-white);
+  margin-bottom: 6px;
+}
+
+.vc-modal-body {
+  font-size: 0.85rem;
+  color: #d1d5db;
+  line-height: 1.48;
+}
+
+.vc-dc-card {
+  background: var(--bg-card);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  font-family: var(--font-mono);
+}
+
+.vc-bar-bg {
+  width: 100%;
+  height: 7px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 6px 0 8px 0;
+}
+
+.vc-badge {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.vc-toast {
+  position: fixed;
+  bottom: 22px;
+  right: 24px;
+  z-index: 9999;
+  background: #161924;
+  border: 1px solid var(--accent-green);
+  color: var(--text-white);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  padding: 12px 18px;
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.65);
+}
+
+@keyframes dashFlow {
+  to {
+    stroke-dashoffset: -36;
+  }
+}
+
+.vc-power-flow-active {
+  stroke-dasharray: 10 8;
+  animation: dashFlow 0.9s linear infinite;
+}
