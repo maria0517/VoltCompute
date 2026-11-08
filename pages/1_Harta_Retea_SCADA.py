@@ -17,6 +17,7 @@ import streamlit as st
 
 from agent import VoltComputeAgent
 from schemas import GridTelemetry
+from services.ring_buffer import RingBufferEngine, get_shared_ring_buffer
 from services.router import (
     FIXED_TARIFF_EUR_MWH,
     HVAC_MAX_TEMP_C,
@@ -291,6 +292,7 @@ def _month_window(cycle: int) -> Tuple[datetime, int, int]:
 
 if (
     "agent" not in st.session_state
+    or type(st.session_state.agent) is not VoltComputeAgent
     or not hasattr(st.session_state.agent, "estimate_injection")
     or "injection_model" not in (st.session_state.agent.model_artifact or {})
 ):
@@ -300,56 +302,48 @@ if (
 
 if "pred_cache" not in st.session_state:
     st.session_state.pred_cache = {}
-if "autoplay" not in st.session_state:
-    st.session_state.autoplay = False
 if "pending_advance" not in st.session_state:
     st.session_state.pending_advance = False
-if "dc_history" not in st.session_state:
-    st.session_state.dc_history = {
-        n["id"]: dict(_PROFILE_BY_ID.get(n["id"], {}).get("history", {"offers_sent": 0, "offers_accepted": 0}))
-        for n in DATACENTERS
-    }
-if "deals" not in st.session_state:
-    st.session_state.deals = {}
-if "refused" not in st.session_state:
-    st.session_state.refused = {}
-if "ring_cycle" not in st.session_state:
-    st.session_state.ring_cycle = 0
 
-_, _init_month_hours, _ = _month_window(int(st.session_state.ring_cycle))
+_, _init_month_hours, _ = _month_window(0)
+_default_candidates = (
+    feed[(feed["hour"] == 13) & (feed.get("surplus_mw", 0) > 3.5)]
+    if "surplus_mw" in feed.columns
+    else feed.iloc[0:0]
+)
+if len(_default_candidates) > 1:
+    _default_step = int(_default_candidates.index[1])
+elif len(_default_candidates) > 0:
+    _default_step = int(_default_candidates.index[0])
+else:
+    _noon = feed[feed["hour"].isin([12, 13])]
+    _default_step = int(_noon.index[0]) if len(_noon) > 0 else 13
 
-if "current_step" not in st.session_state:
-    candidates = (
-        feed[(feed["hour"] == 13) & (feed.get("surplus_mw", 0) > 3.5)]
-        if "surplus_mw" in feed.columns
-        else feed.iloc[0:0]
-    )
-    if len(candidates) > 1:
-        default_step = int(candidates.index[1])
-    elif len(candidates) > 0:
-        default_step = int(candidates.index[0])
-    else:
-        noon = feed[feed["hour"].isin([12, 13])]
-        default_step = int(noon.index[0]) if len(noon) > 0 else 13
-    st.session_state.current_step = int(default_step % _init_month_hours)
+SH: RingBufferEngine = get_shared_ring_buffer(
+    initial_step=int((_default_step - LOOKAHEAD_HOURS) % _init_month_hours),
+    datacenters=DC_PROFILES["datacenters"],
+    tick_interval_sec=AUTOPLAY_SECONDS,
+)
 
-_toast_msg = st.session_state.pop("toast_msg", None)
+_toast_msg = st.session_state.pop("toast_msg", None) or SH.pop_autopause_toast()
 if _toast_msg:
     st.toast(_toast_msg)
 
 if st.session_state.pending_advance:
     st.session_state.pending_advance = False
-    _, _cur_m_hours, _ = _month_window(int(st.session_state.ring_cycle))
-    nxt_step = int(st.session_state.current_step) + 1
-    if nxt_step >= _cur_m_hours:
-        st.session_state.current_step = 0
-        st.session_state.ring_cycle = int(st.session_state.ring_cycle) + 1
-    else:
-        st.session_state.current_step = nxt_step
+    SH.step_forward(stop_autoplay=False)
 
-CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS = _month_window(int(st.session_state.ring_cycle))
-if int(st.session_state.current_step) >= N_ROWS:
-    st.session_state.current_step = int(st.session_state.current_step) % N_ROWS
+CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS = _month_window(int(SH["ring_cycle"]))
+if int(SH["current_step"]) >= N_ROWS:
+    SH["current_step"] = int(SH["current_step"]) % N_ROWS
+
+# Sincronizăm starea sesiunii cu motorul RingBuffer partajat
+st.session_state.autoplay = SH.is_running
+st.session_state.current_step = int(SH["current_step"])
+st.session_state.ring_cycle = int(SH["ring_cycle"])
+st.session_state.deals = SH["deals"]
+st.session_state.refused = SH["refused"]
+st.session_state.dc_history = SH["dc_history"]
 
 agent: VoltComputeAgent = st.session_state.agent
 
@@ -444,10 +438,7 @@ def step_price(v_idx: int) -> float:
 
 
 def _surplus_trigger(step: int) -> bool:
-    return (
-        predict_step(step)[0] > agent.MIN_SURPLUS_THRESHOLD_MW
-        and step_price(step) < agent.MAX_PZU_PRICE_EUR
-    )
+    return predict_step(step)[0] > agent.MIN_SURPLUS_THRESHOLD_MW
 
 
 def step_qualifies(step: int) -> bool:
@@ -608,35 +599,30 @@ def _reset_offers(steps: List[int]) -> None:
 
 
 def _step_back() -> None:
+    cyc, stp = SH.step_back()
+    st.session_state.ring_cycle = cyc
+    st.session_state.current_step = stp
     st.session_state.autoplay = False
-    prv = int(st.session_state.current_step) - 1
-    if prv < 0:
-        prev_cycle = int(st.session_state.ring_cycle) - 1
-        _, prev_month_hours, _ = _month_window(prev_cycle)
-        st.session_state.ring_cycle = prev_cycle
-        st.session_state.current_step = prev_month_hours - 1
-    else:
-        st.session_state.current_step = prv
 
 
 def _step_forward() -> None:
+    cyc, stp = SH.step_forward(stop_autoplay=True)
+    st.session_state.ring_cycle = cyc
+    st.session_state.current_step = stp
     st.session_state.autoplay = False
-    _, cur_month_hours, _ = _month_window(int(st.session_state.ring_cycle))
-    nxt = int(st.session_state.current_step) + 1
-    if nxt >= cur_month_hours:
-        st.session_state.current_step = 0
-        st.session_state.ring_cycle = int(st.session_state.ring_cycle) + 1
-    else:
-        st.session_state.current_step = nxt
 
 
 def _toggle_play() -> None:
-    st.session_state.autoplay = not st.session_state.autoplay
+    st.session_state.autoplay = SH.toggle()
 
 
 # =====================================================================
 # HEADER + NAVIGARE ÎNAPOI LA CONSOLA PRINCIPALĂ
 # =====================================================================
+rb_snap = SH.status_snapshot()
+thread_badge_color = "#00FF9D" if rb_snap["is_running"] else "#F59E0B"
+thread_state_lbl = "LIVE TICKING" if rb_snap["is_running"] else "PAUSED"
+
 top_nav, top_title = st.columns([1.4, 5.6], gap="small")
 with top_nav:
     try:
@@ -648,7 +634,7 @@ with top_title:
         f"""
 <div style="display:flex;justify-content:space-between;align-items:center;padding-top:4px;">
   <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // SCADA NATIONAL POWER FLOW MAP</div>
-  <div class="vc-sub">LUNA CURENTĂ: {CYCLE_START_DT.strftime('%Y-%m')} (Windows API) · {N_ROWS}h în lună (Luna #{int(st.session_state.ring_cycle) + 1}) · TOPOLOGIE 400 kV</div>
+  <div class="vc-sub"><span style="color:{thread_badge_color};font-family:monospace;">🧵 {rb_snap["thread_name"]} [{thread_state_lbl} · Tick #{rb_snap["tick_count"]}]</span> · LUNA: {CYCLE_START_DT.strftime('%Y-%m')} · {N_ROWS}h (Luna #{int(st.session_state.ring_cycle) + 1})</div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -660,15 +646,17 @@ st.session_state[slider_key] = int(st.session_state.current_step)
 
 
 def _on_slider_change(s_key: str) -> None:
+    cyc, stp = SH.set_step(int(st.session_state[s_key]), stop_autoplay=True)
+    st.session_state.ring_cycle = cyc
+    st.session_state.current_step = stp
     st.session_state.autoplay = False
-    st.session_state.current_step = int(st.session_state[s_key])
 
 
 bar_back, bar_fwd, bar_play, bar_slider = st.columns([1, 1, 1.7, 5], gap="small")
 bar_back.button("◀ Pas Înapoi", on_click=_step_back, width="stretch")
 bar_fwd.button("▶ Pas Înainte", on_click=_step_forward, width="stretch")
 bar_play.button(
-    "⏹ Stop Live Feed" if st.session_state.autoplay else "▶▶ Play Live Feed (Ring Buffer Continuu 1s)",
+    "⏹ Stop Live Feed" if SH.is_running else "▶▶ Play Live Feed (Ring Buffer Continuu 1s)",
     on_click=_toggle_play,
     type="primary",
     width="stretch",
@@ -1100,7 +1088,6 @@ with col_dc:
             unsafe_allow_html=True,
         )
 
-if st.session_state.autoplay:
+if SH.is_running:
     time.sleep(AUTOPLAY_SECONDS)
-    st.session_state.pending_advance = True
     st.rerun()
