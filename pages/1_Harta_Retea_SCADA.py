@@ -45,6 +45,7 @@ if st.session_state.get("user", {}).get("role") != "ppc":
     st.warning("Harta rețelei este disponibilă doar pentru dispeceratul PPC. Autentifică-te din pagina principală.")
     st.stop()
 
+
 FIXED_PRICE_EUR = FIXED_TARIFF_EUR_MWH
 LOOKAHEAD_HOURS = 2
 HISTORY_HOURS = 24
@@ -291,6 +292,7 @@ def _month_window(cycle: int) -> Tuple[datetime, int, int]:
 
 if (
     "agent" not in st.session_state
+    or type(st.session_state.agent) is not VoltComputeAgent
     or not hasattr(st.session_state.agent, "estimate_injection")
     or "injection_model" not in (st.session_state.agent.model_artifact or {})
 ):
@@ -444,10 +446,7 @@ def step_price(v_idx: int) -> float:
 
 
 def _surplus_trigger(step: int) -> bool:
-    return (
-        predict_step(step)[0] > agent.MIN_SURPLUS_THRESHOLD_MW
-        and step_price(step) < agent.MAX_PZU_PRICE_EUR
-    )
+    return predict_step(step)[0] > agent.MIN_SURPLUS_THRESHOLD_MW
 
 
 def step_qualifies(step: int) -> bool:

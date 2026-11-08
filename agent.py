@@ -254,7 +254,7 @@ class VoltComputeAgent:
         ml_uncertainty_mw = 0.25
         real_shap: Optional[Dict[str, float]] = None
 
-        if grid.solar_irradiance_wm2 <= 1.0:
+        if grid.solar_irradiance_wm2 <= 1.0 or gross_solar_mw <= grid.grid_capacity_limit_mw:
             predicted_surplus_mw = 0.0
         elif self.model_artifact is not None and "model" in self.model_artifact:
             try:
