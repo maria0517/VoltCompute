@@ -390,6 +390,8 @@ def _sync_month_window() -> None:
     st.session_state.deals = SH["deals"]
     st.session_state.refused = SH["refused"]
     st.session_state.dc_history = SH["dc_history"]
+    st.session_state.dc_auto_accept = SH.setdefault("dc_auto_accept", {n["id"]: False for n in DATACENTERS})
+    st.session_state.audit_ledger = SH.setdefault("audit_ledger", [])
 
 
 _sync_month_window()
@@ -655,30 +657,67 @@ def build_offer(steps: List[int]) -> Tuple[Optional[Dict[str, Any]], bool]:
     return None, True
 
 
-def _accept_offer(node_id: str, node_label: str, per_step: Dict[int, float]) -> None:
+def _accept_offer(node_id: str, node_label: str, per_step: Dict[int, float], is_auto: bool = False) -> None:
     """Callback pentru butonul Aprobă (rulează înaintea scriptului, deci nu se pierde în Play)."""
     with SH["lock"]:
         for step, mw in per_step.items():
             SH["deals"].setdefault(step, {})[node_id] = mw
+            dt_step = _ring_dt(step)
+            now_str = dt_T.strftime("%d %b %H:%M") if "dt_T" in globals() else _ring_dt(step - LOOKAHEAD_HOURS).strftime("%d %b %H:%M")
+            ledger = SH.setdefault("audit_ledger", [])
+            ledger.insert(
+                0,
+                {
+                    "Timestamp": now_str,
+                    "Ora Livrare": dt_step.strftime("%d %b %H:%M"),
+                    "Data Center": node_label,
+                    "ID": node_id,
+                    "MWh Contractați": round(mw, 2),
+                    "Tarif (€/MWh)": FIXED_PRICE_EUR,
+                    "Venit PPC (€)": round(mw * FIXED_PRICE_EUR, 2),
+                    "Economie DC (€)": round(mw * (REFERENCE_TARIFF_EUR - FIXED_PRICE_EUR), 2),
+                    "Mod": "vPPA Auto-Pilot" if is_auto else "Manual Dispatch",
+                    "Status": "ACCEPTAT",
+                },
+            )
         hist = SH["dc_history"][node_id]
         hist["offers_sent"] += 1
         hist["offers_accepted"] += 1
     st.session_state.pending_advance = False
     total = sum(per_step.values())
+    mode_prefix = "[vPPA Auto-Pilot]" if is_auto else "[Manual]"
     st.session_state.toast_msg = (
-        f"✅ Tranzacție aprobată: {node_label} trece în COMPUTING cu {total:.2f} MWh la {FIXED_PRICE_EUR:.0f} €/MWh."
+        f"{mode_prefix} Tranzacție aprobată: {node_label} trece în COMPUTING cu {total:.2f} MWh la {FIXED_PRICE_EUR:.0f} €/MWh."
     )
 
 
 def _refuse_offer(node_id: str, node_label: str, per_step: Dict[int, float]) -> None:
     """Callback pentru butonul Refuză: oferta trece la următorul data center disponibil."""
     with SH["lock"]:
-        for step in per_step:
+        for step, mw in per_step.items():
             SH["refused"].setdefault(step, set()).add(node_id)
+            dt_step = _ring_dt(step)
+            now_str = dt_T.strftime("%d %b %H:%M") if "dt_T" in globals() else _ring_dt(step - LOOKAHEAD_HOURS).strftime("%d %b %H:%M")
+            ledger = SH.setdefault("audit_ledger", [])
+            ledger.insert(
+                0,
+                {
+                    "Timestamp": now_str,
+                    "Ora Livrare": dt_step.strftime("%d %b %H:%M"),
+                    "Data Center": node_label,
+                    "ID": node_id,
+                    "MWh Contractați": 0.0,
+                    "Tarif (€/MWh)": FIXED_PRICE_EUR,
+                    "Venit PPC (€)": 0.0,
+                    "Economie DC (€)": 0.0,
+                    "Mod": "Manual Refuse",
+                    "Status": "REFUZAT",
+                },
+            )
         SH["dc_history"][node_id]["offers_sent"] += 1
     st.session_state.pending_advance = False
     st.session_state.toast_msg = (
-        f"⛔ {node_label} a refuzat. Tariful rămâne {FIXED_PRICE_EUR:.0f} €/MWh — oferta sare la următorul nod."
+        f"Refuz înregistrat: {node_label}. Tariful rămâne {FIXED_PRICE_EUR:.0f} €/MWh — oferta trece la următorul nod."
     )
 
 
@@ -868,6 +907,26 @@ def compute_state() -> None:
     open_targets = [T + LOOKAHEAD_HOURS] if step_qualifies(T + LOOKAHEAD_HOURS) else []
     offers_by_target = {h: build_offer([h]) for h in open_targets}  # h -> (ofertă curentă, epuizat)
     pending_offers = {h: o for h, (o, _) in offers_by_target.items() if o is not None}
+
+    # Execuție autonomă (M2M) pentru nodurile care au activat vPPA Auto-Pilot
+    auto_accept_dict = SH.setdefault("dc_auto_accept", {})
+    auto_triggered = False
+    for h, o in list(pending_offers.items()):
+        node_id = o["node"]["id"]
+        if auto_accept_dict.get(node_id, False):
+            node_ref = DC_BY_ID.get(node_id, o["node"])
+            curr_temp = delivered_temperature(T, node_ref)
+            if curr_temp is None or curr_temp <= HVAC_LIMIT_C:
+                _accept_offer(node_id, node_ref.get("short", node_id), dict(o["per_step"]), is_auto=True)
+                auto_triggered = True
+
+    if auto_triggered:
+        # Reîmprospătare oferte după acceptarea automată
+        delivered_T = delivered_mw(T)
+        cumulative_profit = sum(delivered_mw(step) * FIXED_PRICE_EUR for step in SH["deals"])
+        offers_by_target = {h: build_offer([h]) for h in open_targets}
+        pending_offers = {h: o for h, (o, _) in offers_by_target.items() if o is not None}
+
     exhausted_targets = [h for h, (o, ex) in offers_by_target.items() if o is None and ex]
     offer_steps = open_targets
     offer = pending_offers[min(pending_offers)] if pending_offers else None  # cea mai urgentă ofertă
@@ -1166,6 +1225,7 @@ def render_ppc() -> None:
                 "Temp Servere (°C)": current_temp,
                 "Capacitate liberă (MW)": free_capacity,
                 "Status Agent": TABLE_STATUS.get(statuses[node["id"]], statuses[node["id"]]),
+                "vPPA Auto-Pilot": "ACTIV" if SH.setdefault("dc_auto_accept", {}).get(node["id"], False) else "MANUAL",
                 "MWh în Ofertă": pending_mwh,
                 "MWh Contractați": contracted,
                 "Profit PPC (€)": round(total_contracted * FIXED_PRICE_EUR, 2),
@@ -1211,12 +1271,32 @@ def render_ppc() -> None:
         width="stretch",
     )
 
+    with st.expander("JURNAL AUDIT DISPECERAT PPC (TRANZACȚII & ACȚIUNI M2M)", expanded=False):
+        global_ledger = SH.setdefault("audit_ledger", [])
+        if global_ledger:
+            st.dataframe(
+                pd.DataFrame(global_ledger).style.format(
+                    {
+                        "MWh Contractați": "{:.2f}",
+                        "Tarif (€/MWh)": "{:.0f}",
+                        "Venit PPC (€)": "{:,.2f}",
+                        "Economie DC (€)": "{:,.2f}",
+                    }
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("Jurnalul de audit este gol. Tranzacțiile vor fi înregistrate automat pe măsură ce ofertele sunt acceptate sau refuzate.")
+
 # =====================================================================
 # ECRANUL DATA CENTER: doar ofertele adresate acestui DC + contractele lui
 # =====================================================================
 def render_dc(dc_id: str) -> None:
     node = DC_BY_ID[dc_id]
     savings_per_mwh = REFERENCE_TARIFF_EUR - FIXED_PRICE_EUR
+    auto_accept_dict = SH.setdefault("dc_auto_accept", {})
+    is_auto = auto_accept_dict.get(dc_id, False)
 
     st.markdown(
         f"""
@@ -1227,6 +1307,33 @@ def render_dc(dc_id: str) -> None:
 """,
         unsafe_allow_html=True,
     )
+
+    tcol1, tcol2 = st.columns([0.65, 0.35])
+    with tcol1:
+        auto_toggle = st.toggle(
+            "vPPA Auto-Pilot (Acceptare automată oferte de surplus verde)",
+            value=is_auto,
+            key=f"toggle_autopilot_{dc_id}",
+            help="Când este activat, sarcinile flexibile din coada de calcul (Slurm/Kubernetes) absorb automat surplusul PPC la 30 €/MWh, cât timp răcirea HVAC este sub 26°C.",
+        )
+        if auto_toggle != is_auto:
+            SH["dc_auto_accept"][dc_id] = auto_toggle
+            st.rerun()
+    with tcol2:
+        if auto_toggle:
+            st.markdown(
+                '<div style="background:rgba(0,255,157,0.1);border:1px solid #00FF9D;border-radius:6px;padding:6px 12px;color:#00FF9D;font-size:0.82rem;font-weight:600;margin-top:4px;">'
+                'CONTRACT vPPA ACTIV · M2M Auto-Dispatch'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="background:rgba(245,158,11,0.1);border:1px solid #F59E0B;border-radius:6px;padding:6px 12px;color:#F59E0B;font-size:0.82rem;font-weight:600;margin-top:4px;">'
+                'MOD MANUAL · Aprobare per tranzacție'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
     col_offer, col_info = st.columns([0.55, 0.45], gap="large")
 
@@ -1249,12 +1356,12 @@ def render_dc(dc_id: str) -> None:
                 st.markdown(
                     f"""
 <div class="vc-modal" style="border:1px solid rgba(245,158,11,0.6);">
-  <div class="vc-modal-head">🔔 OFERTĂ NOUĂ · ORA {h_label} · VALABILĂ DOAR ACUM</div>
+  <div class="vc-modal-head">OFERTĂ NOUĂ · ORA {h_label} · VALABILĂ DOAR ACUM</div>
   <div class="vc-modal-title">{total_mwh:.2f} MWh energie verde la {FIXED_PRICE_EUR:.0f} €/MWh</div>
   <div class="vc-modal-body">
-    💶 Plătiți: <span class="vc-mono">{total_mwh * FIXED_PRICE_EUR:,.2f} €</span>
+    Cost estimat: <span class="vc-mono">{total_mwh * FIXED_PRICE_EUR:,.2f} €</span>
     <span style="color:#8E95A5;">(la tariful standard: {total_mwh * REFERENCE_TARIFF_EUR:,.2f} €)</span>
-    <br>💚 Economisiți: <span class="vc-mono" style="color:#00FF9D;">{total_mwh * savings_per_mwh:,.2f} €</span>
+    <br>Economie client: <span class="vc-mono" style="color:#00FF9D;">{total_mwh * savings_per_mwh:,.2f} €</span>
   </div>
 </div>
 """,
@@ -1262,7 +1369,7 @@ def render_dc(dc_id: str) -> None:
                 )
                 b_acc, b_ref = st.columns(2)
                 b_acc.button(
-                    "✅ Aprobă Tranzacția",
+                    " Aprobă Tranzacția",
                     key=f"dc_accept_{h}",
                     type="primary",
                     width="stretch",
@@ -1270,7 +1377,7 @@ def render_dc(dc_id: str) -> None:
                     args=(dc_id, node["short"], dict(h_offer["per_step"])),
                 )
                 b_ref.button(
-                    "⛔ Refuză Oferta",
+                    " Refuză Oferta",
                     key=f"dc_refuse_{h}",
                     width="stretch",
                     on_click=_refuse_offer,
@@ -1281,13 +1388,13 @@ def render_dc(dc_id: str) -> None:
             mine = SH["deals"].get(tgt, {}).get(dc_id, 0.0)
             refused_now = dc_id in SH["refused"].get(tgt, set())
             if mine > 0.0:
-                msg = f"✅ Ați acceptat {mine:.2f} MWh pentru ora {_ring_dt(tgt).strftime('%H:%M')}."
+                msg = f" Ați acceptat {mine:.2f} MWh pentru ora {_ring_dt(tgt).strftime('%H:%M')}."
             elif refused_now:
-                msg = f"⛔ Ați refuzat oferta pentru ora {_ring_dt(tgt).strftime('%H:%M')}."
+                msg = f" Ați refuzat oferta pentru ora {_ring_dt(tgt).strftime('%H:%M')}."
             else:
                 msg = "Nu aveți nicio ofertă activă în acest moment. Ofertele noi apar automat aici."
             offer_slot.markdown(
-                f'<div class="vc-modal"><div class="vc-modal-head">⚡ FĂRĂ OFERTĂ ACTIVĂ</div>'
+                f'<div class="vc-modal"><div class="vc-modal-head"> FĂRĂ OFERTĂ ACTIVĂ</div>'
                 f'<div class="vc-modal-body">{msg}</div></div>',
                 unsafe_allow_html=True,
             )
@@ -1332,6 +1439,23 @@ def render_dc(dc_id: str) -> None:
             )
         else:
             contracts_slot.caption("Încă nu aveți contracte.")
+
+        # Jurnal Audit Tranzacții & Istoric Decizional pentru acest Data Center
+        dc_ledger = [entry for entry in SH.setdefault("audit_ledger", []) if entry.get("ID") == dc_id]
+        with st.expander("JURNAL AUDIT TRANZACȚII & vPPA (Nodul Meu)", expanded=True):
+            if dc_ledger:
+                df_ledger = pd.DataFrame(dc_ledger)[
+                    ["Timestamp", "Ora Livrare", "MWh Contractați", "Tarif (€/MWh)", "Economie DC (€)", "Mod", "Status"]
+                ]
+                st.dataframe(
+                    df_ledger.style.format(
+                        {"MWh Contractați": "{:.2f}", "Tarif (€/MWh)": "{:.0f}", "Economie DC (€)": "{:,.2f}"}
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+            else:
+                st.caption("Nicio tranzacție înregistrată încă în jurnalul de audit.")
 
 
 def _pop_toast() -> None:
