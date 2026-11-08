@@ -301,7 +301,7 @@ if "current_step" not in st.session_state:
     else:
         noon = feed[feed["hour"].isin([12, 13])]
         peak_step = int(noon.index[0]) if len(noon) > 0 else 13
-    st.session_state.current_step = int((peak_step - LOOKAHEAD_HOURS) % N_ROWS)
+    st.session_state.current_step = int((peak_step - LOOKAHEAD_HOURS) % _init_month_hours)
 
 # Notificările generate în callback-uri sunt afișate la începutul următoarei rulări
 
