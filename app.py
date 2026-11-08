@@ -191,7 +191,7 @@ def render_login() -> None:
         with st.expander("Conturi demo"):
             st.markdown(
                 "- **PPC (dispecerat):** `ppc` / `ppc123`\n"
-                "- **Data Center:** `bucuresti`, `cluj`, `timisoara` / `dc123`"
+                "- **Data Centere:** `bucuresti`, `cluj`, `timisoara`, `iasi`, `craiova`, `brasov` / `dc123`"
             )
 
 

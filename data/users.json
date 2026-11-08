@@ -31,6 +31,30 @@
       "dc_id": "DC_EDGE_TIMISOARA",
       "salt": "70926ef7bc1e045cd0f4bec2b3cf5d71",
       "hash": "3c8b4222ca5e35791d42fa2a1528754f0d6f9910bee500a20da9865576760270"
+    },
+    {
+      "username": "iasi",
+      "display_name": "HPC Data Center Iași",
+      "role": "datacenter",
+      "dc_id": "DC_HPC_IASI",
+      "salt": "f778b7d5db706c3a5d1758ae2bbc1a2e",
+      "hash": "9140a05f5f54d953898c0c43143f41e8e6d13763a0749ff6c28e5aa9ad3ba379"
+    },
+    {
+      "username": "craiova",
+      "display_name": "Green Grid Data Center Craiova",
+      "role": "datacenter",
+      "dc_id": "DC_GRID_CRAIOVA",
+      "salt": "36d8c1cef5aaefa4ec2dd3dcb36a8223",
+      "hash": "8d9edd0807ce89de8cab56fe8d200947f6a64bf8462039e4bb346f53621737a9"
+    },
+    {
+      "username": "brasov",
+      "display_name": "Algo Data Center Brașov",
+      "role": "datacenter",
+      "dc_id": "DC_ALGO_BRASOV",
+      "salt": "92eff3ce901a4ffa8d872975f9f9da3e",
+      "hash": "c59bdb0cf7756c0f69c4d79971591c1d33aa32cfc8335288f33ca94ab072d0a0"
     }
   ]
 }

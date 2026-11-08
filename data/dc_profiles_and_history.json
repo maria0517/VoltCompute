@@ -38,6 +38,42 @@
         "offers_sent": 0,
         "offers_accepted": 0
       }
+    },
+    {
+      "id": "DC_HPC_IASI",
+      "name": "HPC Data Center Iași",
+      "short": "HPC Iași",
+      "workload": "Genomică & Bioinformatică AI",
+      "queue": 38,
+      "color": "#F59E0B",
+      "history": {
+        "offers_sent": 0,
+        "offers_accepted": 0
+      }
+    },
+    {
+      "id": "DC_GRID_CRAIOVA",
+      "name": "Green Grid Data Center Craiova",
+      "short": "Grid Craiova",
+      "workload": "Simulări CFD & Automotive HPC",
+      "queue": 24,
+      "color": "#EC4899",
+      "history": {
+        "offers_sent": 0,
+        "offers_accepted": 0
+      }
+    },
+    {
+      "id": "DC_ALGO_BRASOV",
+      "name": "Algo Data Center Brașov",
+      "short": "Algo Brașov",
+      "workload": "Modele Climatice & Render 3D",
+      "queue": 16,
+      "color": "#10B981",
+      "history": {
+        "offers_sent": 0,
+        "offers_accepted": 0
+      }
     }
   ]
 }
