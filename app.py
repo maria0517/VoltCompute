@@ -346,7 +346,7 @@ def _default_start_step() -> int:
     else:
         noon = feed[feed["hour"].isin([12, 13])]
         peak_step = int(noon.index[0]) if len(noon) > 0 else 13
-    return int((peak_step - LOOKAHEAD_HOURS) % N_ROWS)
+    return int((peak_step - LOOKAHEAD_HOURS))
 
 
 @st.cache_resource
