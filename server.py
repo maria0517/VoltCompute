@@ -229,3 +229,44 @@ def get_bucharest_weather_lookahead_endpoint(
     from services.weather_service import get_weather_lookahead
 
     return get_weather_lookahead(hours_ahead=hours_ahead)
+
+
+
+class RingBufferControlRequest(BaseModel):
+    """Payload pentru controlul thread-ului daemon Ring Buffer."""
+
+    action: str  # "start", "pause", "toggle", "step_forward", "step_back", "set_step"
+    step: Optional[int] = None
+
+
+@app.get("/api/ring-buffer/status")
+def get_ring_buffer_status() -> Dict[str, Any]:
+    """Returnează telemetria live a thread-ului daemon `SCADA-RingBuffer-Daemon`."""
+    from services.ring_buffer import get_shared_ring_buffer
+
+    rb = get_shared_ring_buffer(datacenters=load_profiles()["datacenters"])
+    return rb.status_snapshot()
+
+
+@app.post("/api/ring-buffer/control")
+def control_ring_buffer(payload: RingBufferControlRequest) -> Dict[str, Any]:
+    """Controlează motorul concurent Ring Buffer (start/pause/toggle/step)."""
+    from services.ring_buffer import get_shared_ring_buffer
+
+    rb = get_shared_ring_buffer(datacenters=load_profiles()["datacenters"])
+    act = payload.action.lower().strip()
+    if act == "start":
+        rb.start()
+    elif act == "pause":
+        rb.pause()
+    elif act == "toggle":
+        rb.toggle()
+    elif act == "step_forward":
+        rb.step_forward(stop_autoplay=True)
+    elif act == "step_back":
+        rb.step_back()
+    elif act == "set_step" and payload.step is not None:
+        rb.set_step(payload.step, stop_autoplay=True)
+    else:
+        raise HTTPException(status_code=400, detail=f"Acțiune necunoscută: {payload.action}")
+    return rb.status_snapshot()

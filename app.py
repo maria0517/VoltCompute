@@ -14,6 +14,7 @@ import streamlit as st
 from agent import VoltComputeAgent
 from schemas import GridTelemetry
 from services.auth import authenticate
+from services.ring_buffer import RingBufferEngine, get_shared_ring_buffer
 from services.router import (
     FIXED_TARIFF_EUR_MWH,
     HVAC_MAX_TEMP_C,
@@ -346,48 +347,35 @@ def _default_start_step() -> int:
     else:
         noon = feed[feed["hour"].isin([12, 13])]
         peak_step = int(noon.index[0]) if len(noon) > 0 else 13
-    st.session_state.current_step = int((peak_step - LOOKAHEAD_HOURS) % _init_month_hours)
+    return int((peak_step - LOOKAHEAD_HOURS) % N_ROWS)
 
 
 @st.cache_resource
-def shared_state() -> Dict[str, Any]:
+def shared_state() -> RingBufferEngine:
     """
-    Starea COMUNĂ tuturor sesiunilor (un singur proces de server): ora curentă din dataset,
+    Starea COMUNĂ tuturor sesiunilor (un singur proces de server) gestionată de `RingBufferEngine`
+    cu thread daemon de fundal (`SCADA-RingBuffer-Daemon`): ora curentă din dataset,
     ofertele acceptate / refuzate și istoricul DC. Așa, când un Data Center apasă Aprobă,
-    dispeceratul PPC vede imediat tranzacția, iar DC-urile văd ora pe care o controlează PPC.
+    dispeceratul PPC vede imediat tranzacția, iar ceasul SCADA poate ticăi autonom în background.
     """
-    return {
-        "lock": threading.Lock(),
-        "current_step": _default_start_step(),
-        "ring_cycle": 0,
-        # deals[pas][id_datacenter] = MW contractați la pasul respectiv
-        "deals": {},
-        # refused[pas] = id-urile datacenter-elor care au refuzat oferta pentru pasul respectiv
-        "refused": {},
-        # Istoricul ofertelor per nod; actualizat la fiecare Aprobă / Refuză -> clasamentul se adaptează
-        "dc_history": {
-            n["id"]: dict(n.get("history", {"offers_sent": 0, "offers_accepted": 0})) for n in DATACENTERS
-        },
-    }
+    return get_shared_ring_buffer(
+        initial_step=_default_start_step(),
+        datacenters=DATACENTERS,
+        tick_interval_sec=AUTOPLAY_SECONDS,
+    )
 
 
-SH: Dict[str, Any] = shared_state()
+SH: RingBufferEngine = shared_state()
 
-# Notificările generate în callback-uri sunt afișate la începutul următoarei rulări
-_toast_msg = st.session_state.pop("toast_msg", None)
+# Notificările generate în callback-uri sau de thread-ul daemon sunt afișate la începutul rulării
+_toast_msg = st.session_state.pop("toast_msg", None) or SH.pop_autopause_toast()
 if _toast_msg:
     st.toast(_toast_msg)
 
-# Avansarea automată în Ring Buffer (când se termină luna curentă la 23:00, trece în ziua 1 ora 00:00 a lunii următoare)
+# Avansarea manuală dacă a fost cerută explicit prin pending_advance
 if st.session_state.pending_advance:
     st.session_state.pending_advance = False
-    _, _cur_month_hours, _ = _month_window(int(SH["ring_cycle"]))
-    nxt_step = int(SH["current_step"]) + 1
-    if nxt_step >= _cur_month_hours:
-        SH["current_step"] = 0
-        SH["ring_cycle"] = int(SH["ring_cycle"]) + 1
-    else:
-        SH["current_step"] = nxt_step
+    SH.step_forward(stop_autoplay=False)
 
 
 def _sync_month_window() -> None:
@@ -395,7 +383,8 @@ def _sync_month_window() -> None:
     global CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS
     CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS = _month_window(int(SH["ring_cycle"]))
     SH["current_step"] = int(min(max(0, int(SH["current_step"])), N_ROWS - 1))
-    # Pagina „Harta Rețea SCADA” citește aceste chei din sesiune: îi dăm aceleași obiecte ca starea comună
+    # Sincronizăm starea sesiunii curente cu motorul RingBuffer partajat
+    st.session_state.autoplay = SH.is_running
     st.session_state.current_step = SH["current_step"]
     st.session_state.ring_cycle = SH["ring_cycle"]
     st.session_state.deals = SH["deals"]
@@ -486,8 +475,9 @@ def predict_step(v_idx: int) -> Tuple[float, float, Dict[str, float], float]:
     Calculează predicția modelului AI (antrenat DOAR pe train_energy_data.csv)
     pe datele noi din Ring Buffer la pasul `v_idx`:
     returnează (surplus_predicted_mw, confidence, shap_dict, predicted_injection_mw).
+    Folosește cache-ul partajat thread-safe din `SH` pentru a putea fi apelată și din thread-ul daemon.
     """
-    cache = st.session_state.pred_cache
+    cache = SH.setdefault("pred_cache", {})
     if v_idx not in cache or len(cache[v_idx]) != 4:
         grid = grid_telemetry(v_idx)
         surplus_pred, conf, shap_dict = agent.estimate(grid)
@@ -712,43 +702,60 @@ def _reset_offers(steps: List[int]) -> None:
     st.session_state.toast_msg = "↩️ Ofertele pentru interval au fost resetate (istoricul DC restaurat)."
 
 
+def _check_autopause_for_step(cycle: int, step: int) -> Optional[str]:
+    """
+    Callback Human-in-the-Loop executat direct în thread-ul daemon `SCADA-RingBuffer-Daemon`:
+    oprește automat ceasul dacă la pasul curent există o ofertă nouă la T+2 care cere decizie.
+    """
+    _, _, off_h = _month_window(cycle)
+    abs_step = off_h + int(step)
+    target_h = abs_step + LOOKAHEAD_HOURS
+    paused_targets = SH.setdefault("autopaused_targets", set())
+    if target_h in paused_targets:
+        return None
+    if step_qualifies(target_h):
+        cur_offer, _ = build_offer([target_h])
+        if cur_offer is not None:
+            paused_targets.add(target_h)
+            return (
+                f"⏸ Live Feed oprit de thread-ul SCADA: ofertă nouă pentru ora "
+                f"{_ring_dt(target_h).strftime('%H:%M')} — valabilă doar în ora curentă."
+            )
+    return None
+
+
+SH.set_autopause_checker(_check_autopause_for_step)
+
+
 def _step_back() -> None:
-    """Pas Înapoi: revine cu o oră (trece din 00:00 în 23:00 a ciclului anterior)."""
+    """Pas Înapoi: revine cu o oră în Ring Buffer (00:00 -> 23:00 a ciclului anterior)."""
+    SH.step_back()
     st.session_state.autoplay = False
-    prv = int(SH["current_step"]) - 1
-    if prv < 0:
-        prev_cycle = int(SH["ring_cycle"]) - 1
-        _, prev_month_hours, _ = _month_window(prev_cycle)
-        SH["ring_cycle"] = prev_cycle
-        SH["current_step"] = prev_month_hours - 1
-    else:
-        SH["current_step"] = prv
 
 
 def _next_hour() -> None:
-    """Pas Înainte / Simulează Ora Următoare: avansează o oră (Ring Buffer, 23:00 -> 00:00 fără oprire)."""
+    """Pas Înainte / Simulează Ora Următoare: avansează o oră în Ring Buffer (23:00 -> 00:00 fără oprire)."""
+    SH.step_forward(stop_autoplay=True)
     st.session_state.autoplay = False
-    _, cur_month_hours, _ = _month_window(int(SH["ring_cycle"]))
-    nxt = int(SH["current_step"]) + 1
-    if nxt >= cur_month_hours:
-        SH["current_step"] = 0
-        SH["ring_cycle"] = int(SH["ring_cycle"]) + 1
-    else:
-        SH["current_step"] = nxt
 
 
 def _toggle_play() -> None:
-    st.session_state.autoplay = not st.session_state.autoplay
+    """Pornește sau pune pe pauză thread-ul de fundal `SCADA-RingBuffer-Daemon`."""
+    st.session_state.autoplay = SH.toggle()
 
 
 def _on_slider_change(s_key: str) -> None:
+    SH.set_step(int(st.session_state[s_key]), stop_autoplay=True)
     st.session_state.autoplay = False
-    SH["current_step"] = int(st.session_state[s_key])
 
 
 def render_ppc_header() -> None:
     """Titlu + bara de control temporal (doar dispeceratul PPC controlează ora din dataset)."""
+    _sync_month_window()
     abs_T = CYCLE_OFFSET_HOURS + int(SH["current_step"])
+    rb_snap = SH.status_snapshot()
+    thread_badge_color = "#00FF9D" if rb_snap["is_running"] else "#F59E0B"
+    thread_state_lbl = "LIVE TICKING" if rb_snap["is_running"] else "PAUSED"
     # Calculăm eroarea MAE live pe ultimele 24h (doar orele de zi cu activitate solară) pentru afișare transparentă
     _day_hist_errors = [
         abs(net_injection_mw(i) - predict_step(i)[3])
@@ -763,7 +770,7 @@ def render_ppc_header() -> None:
             f"""
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
       <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH</div>
-      <div class="vc-sub">👤 {USER["display_name"]}</div>
+      <div class="vc-sub">👤 {USER.get("display_name", "Operator")} · <span style="color:{thread_badge_color};font-family:monospace;">🧵 {rb_snap["thread_name"]} [{thread_state_lbl} · Tick #{rb_snap["tick_count"]}]</span></div>
       <div class="vc-sub">LUNA CURENTĂ: {CYCLE_START_DT.strftime('%Y-%m')} (Windows API) · {N_ROWS}h în lună (Luna #{int(SH["ring_cycle"]) + 1}) · MAE Live (24h): ±{live_window_mae:.2f} MW</div>
     </div>
     """,
@@ -790,12 +797,12 @@ def render_ppc_header() -> None:
         help="Pas Înainte: avansează o oră în telemetria din fișiere.",
     )
     bar_play.button(
-        "⏹ Stop Live Feed" if st.session_state.autoplay else "▶▶ Play Live Feed",
+        "⏹ Stop Live Feed" if SH.is_running else "▶▶ Play Live Feed",
         on_click=_toggle_play,
         width="stretch",
         help=(
-            f"Avansează automat câte o oră la fiecare {AUTOPLAY_SECONDS:.0f}s. Se oprește singur când "
-            "apare o ofertă care cere decizia dispecerului (Aprobă / Refuză)."
+            f"Pornește/oprește thread-ul de fundal SCADA-RingBuffer-Daemon ({AUTOPLAY_SECONDS:.0f}s = 1h). "
+            "Thread-ul se pune automat pe pauză când apare o ofertă nouă (Human-in-the-Loop)."
         ),
     )
     with bar_slider:
@@ -1215,7 +1222,7 @@ def render_dc(dc_id: str) -> None:
         f"""
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
   <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // {node['name'].upper()}</div>
-  <div class="vc-sub">👤 {USER["display_name"]} · ORA CURENTĂ: <b style="color:#E5E7EB;">{dt_T.strftime("%a %d %b · %H:%M")}</b></div>
+  <div class="vc-sub">👤 {USER.get("display_name", "Operator")} · ORA CURENTĂ: <b style="color:#E5E7EB;">{dt_T.strftime("%a %d %b · %H:%M")}</b></div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -1328,7 +1335,7 @@ def render_dc(dc_id: str) -> None:
 
 
 def _pop_toast() -> None:
-    msg = st.session_state.pop("toast_msg", None)
+    msg = st.session_state.pop("toast_msg", None) or SH.pop_autopause_toast()
     if msg:
         st.toast(msg)
 
@@ -1350,27 +1357,26 @@ def _dc_live() -> None:
 
 if ROLE == "ppc":
     render_ppc_header()
-    # PPC vede automat răspunsurile DC-urilor (la 3s); în Play rulează oricum toată pagina
-    st.fragment(run_every=None if st.session_state.autoplay else "3s")(_ppc_live)()
+    # PPC vede automat răspunsurile DC-urilor (la 3s); în Play rulează toată pagina sincronizat cu thread-ul daemon
+    st.fragment(run_every=None if SH.is_running else "3s")(_ppc_live)()
 
-    # AUTO-STEP CONTINUU ÎN RING BUFFER (FĂRĂ OPRIRE LA FINALUL DATELOR)
-    # Human-in-the-Loop: Live Feed-ul se oprește singur când apare o ofertă nouă.
-    if st.session_state.autoplay:
-        paused_targets = st.session_state.setdefault("autopaused_targets", set())
+    # SINCRONIZARE CU THREAD-UL DE FUNDAL SCADA-RingBuffer-Daemon
+    # Human-in-the-Loop: Live Feed-ul se oprește automat când apare o ofertă nouă.
+    if SH.is_running:
+        paused_targets = SH.setdefault("autopaused_targets", set())
         new_targets = [h for h in sorted(pending_offers) if h not in paused_targets]
         if new_targets:
-            # Pauză o singură dată per oră țintă nouă; la un nou Play, feed-ul poate trece mai departe
+            # Pauză o singură dată per oră țintă nouă; la un nou Play, thread-ul daemon trece mai departe
             paused_targets.update(new_targets)
-            st.session_state.autoplay = False
-            st.toast(
+            SH.pause(
                 f"⏸ Live Feed oprit: ofertă nouă pentru ora {_ring_dt(new_targets[0]).strftime('%H:%M')} "
                 "— e valabilă doar în ora curentă."
             )
+            st.session_state.autoplay = False
             st.rerun()
         else:
             time.sleep(AUTOPLAY_SECONDS)
-            st.session_state.pending_advance = True
             st.rerun()
 else:
-    # Data Center-ul vede ofertele noi automat (la 2s), fără să apese nimic
+    # Data Center-ul vede ofertele noi și avansarea thread-ului SCADA automat (la 2s), fără să apese nimic
     st.fragment(run_every="2s")(_dc_live)()
