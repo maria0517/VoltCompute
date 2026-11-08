@@ -87,7 +87,7 @@ def test_thermal_limit_blocks_allocation(agent: VoltComputeAgent) -> None:
 
 def test_high_surplus_generates_offer_at_30_eur(agent: VoltComputeAgent) -> None:
     """
-    Verifică generarea ofertei (OFFER_GENERATED) la 30 EUR/MWh atunci când surplusul > 5.0 MW, PZU < 25 EUR/MWh,
+    Verifică generarea ofertei (OFFER_GENERATED) la 30 EUR/MWh atunci când linia este depășită,
     confidența >= 0.75 și temperatura serverelor <= 26.0°C.
     """
     grid = GridTelemetry(
@@ -148,9 +148,18 @@ def test_anomalous_sensor_triggers_uncertain(agent: VoltComputeAgent) -> None:
     assert decision.data_quality_warnings
 
 
-def test_high_pzu_price_blocks_offer(agent: VoltComputeAgent) -> None:
-    """Fără arbitraj dacă prețul PZU este >= 25 EUR/MWh, chiar și cu surplus mare."""
-    grid = GridTelemetry(hour=13, solar_irradiance_wm2=1100.0, ambient_temp_celsius=25.0, day_ahead_price_eur=60.0)
+def test_any_line_overload_generates_offer_regardless_of_price(agent: VoltComputeAgent) -> None:
+    """Orice depășire prezisă a liniei primește ofertă, inclusiv la preț PZU ridicat (congestia e fizică)."""
+    grid = GridTelemetry(hour=13, solar_irradiance_wm2=1100.0, ambient_temp_celsius=25.0, day_ahead_price_eur=90.0)
+    center = ResearchCenterTelemetry(cooling_temp_celsius=19.0, max_absorb_capacity_mw=6.0, pending_compute_jobs=10)
+    decision = agent.run_cycle(grid, center, confidence_override=0.95)
+    assert decision.status == "OFFER_GENERATED"
+    assert decision.allocated_mw > 0.0
+
+
+def test_no_overload_means_no_offer(agent: VoltComputeAgent) -> None:
+    """Fără depășire a liniei (iradianță mică) nu se generează ofertă."""
+    grid = GridTelemetry(hour=9, solar_irradiance_wm2=300.0, ambient_temp_celsius=20.0, day_ahead_price_eur=5.0)
     center = ResearchCenterTelemetry(cooling_temp_celsius=19.0, max_absorb_capacity_mw=6.0, pending_compute_jobs=10)
     decision = agent.run_cycle(grid, center, confidence_override=0.95)
     assert decision.status == "NORMAL_GRID_OPERATION"
@@ -165,3 +174,4 @@ def test_shap_values_come_from_model(agent: VoltComputeAgent) -> None:
     _, _, shap_vals = agent.estimate(grid)
     assert set(shap_vals) <= set(agent.model_artifact["feature_columns"])
     assert "effective_solar_index" in shap_vals or "solar_irradiance_wm2" in shap_vals
+
