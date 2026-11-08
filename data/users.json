@@ -1,0 +1,36 @@
+{
+  "_comment": "Conturi demo. Parolele sunt salvate ca hash PBKDF2-SHA256 (vezi services/auth.py).",
+  "users": [
+    {
+      "username": "ppc",
+      "display_name": "Dispecerat PPC",
+      "role": "ppc",
+      "salt": "e34c63d92cb9cb57fa83378d5b32871c",
+      "hash": "5d6c4a9f0e2a50341143410af7a3efdf0c1330030a34b51da4a9f05bf193c9db"
+    },
+    {
+      "username": "bucuresti",
+      "display_name": "AI Data Center București",
+      "role": "datacenter",
+      "dc_id": "DC_AI_BUCURESTI",
+      "salt": "beb24cda1263f24eed0d8ca22dcbf2e7",
+      "hash": "785fe65acadf76fa0b5e4be186b4c8646f3923c4b3ccd37c3b074a35a2ebd5fa"
+    },
+    {
+      "username": "cluj",
+      "display_name": "Cloud Data Center Cluj",
+      "role": "datacenter",
+      "dc_id": "DC_CLOUD_CLUJ",
+      "salt": "0d3e76575c91fa23c89b90bb5bf6c519",
+      "hash": "923e57298ebc5a699162dcd1506825139b8b6aaf51d4d60328975758a9ac0270"
+    },
+    {
+      "username": "timisoara",
+      "display_name": "Edge Data Center Timișoara",
+      "role": "datacenter",
+      "dc_id": "DC_EDGE_TIMISOARA",
+      "salt": "70926ef7bc1e045cd0f4bec2b3cf5d71",
+      "hash": "3c8b4222ca5e35791d42fa2a1528754f0d6f9910bee500a20da9865576760270"
+    }
+  ]
+}

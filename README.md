@@ -80,6 +80,14 @@ pytest -v
 streamlit run app.py
 ```
 
+#### Conturi demo (pagina de logare)
+| Rol | Utilizator | Parolă | Ce vede |
+|---|---|---|---|
+| Dispecerat PPC | `ppc` | `ppc123` | grafice, metrici, tabelul de arbitraj, control temporal (Pas / Play / timeline) |
+| Data Center | `bucuresti`, `cluj`, `timisoara` | `dc123` | doar ofertele adresate lui (Aprobă / Refuză), telemetria proprie și contractele lui |
+
+PPC și DC-urile împart aceeași stare pe server: ora o controlează PPC, iar o ofertă aprobată de un DC apare imediat la PPC (ecranele se actualizează automat la 2–3 s). Pentru demo, deschide PPC și un DC în două ferestre diferite (sau una în mod incognito).
+
 ### 5. (Opțional) Pornirea serverului FastAPI
 ```bash
 uvicorn server:app --reload --port 8000
