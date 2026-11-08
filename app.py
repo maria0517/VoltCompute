@@ -1,5 +1,6 @@
 import calendar
 import ctypes
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ import streamlit as st
 
 from agent import VoltComputeAgent
 from schemas import GridTelemetry
+from services.auth import authenticate
 from services.router import (
     FIXED_TARIFF_EUR_MWH,
     HVAC_MAX_TEMP_C,
@@ -147,6 +149,60 @@ div[data-testid="stColumn"]:has(#vc-dc-marker), div[data-testid="column"]:has(#v
 )
 
 # =====================================================================
+# AUTENTIFICARE: PPC (dispecerat) sau Data Center (doar ofertele și contractele proprii)
+# =====================================================================
+def _do_login() -> None:
+    user = authenticate(st.session_state.get("login_user", ""), st.session_state.get("login_pass", ""))
+    if user is None:
+        st.session_state.login_error = "Utilizator sau parolă greșită."
+        return
+    st.session_state.user = user
+    st.session_state.pop("login_error", None)
+    st.session_state.pop("login_pass", None)
+
+
+def _do_logout() -> None:
+    for k in ("user", "autoplay", "pending_advance"):
+        st.session_state.pop(k, None)
+
+
+def render_login() -> None:
+    st.markdown(
+        """
+<style>
+.vc-login-title {font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:1.5rem;font-weight:700;
+  color:#FFFFFF;text-align:center;margin-top:8vh;}
+.vc-login-sub {text-align:center;color:#8E95A5;font-size:0.85rem;margin-bottom:18px;}
+</style>
+<div class="vc-login-title"><span class="vc-live"></span>VOLTCOMPUTE</div>
+<div class="vc-login-sub">Arbitraj surplus solar PPC → Data Center-e · autentificare</div>
+""",
+        unsafe_allow_html=True,
+    )
+    _, mid, _ = st.columns([1, 1.1, 1])
+    with mid:
+        with st.form("login_form", border=True):
+            st.text_input("Utilizator", key="login_user", placeholder="ex. ppc sau cluj")
+            st.text_input("Parolă", key="login_pass", type="password")
+            st.form_submit_button("Intră în cont", type="primary", width="stretch", on_click=_do_login)
+        if st.session_state.get("login_error"):
+            st.error(st.session_state.login_error)
+        with st.expander("Conturi demo"):
+            st.markdown(
+                "- **PPC (dispecerat):** `ppc` / `ppc123`\n"
+                "- **Data Center:** `bucuresti`, `cluj`, `timisoara` / `dc123`"
+            )
+
+
+if "user" not in st.session_state:
+    render_login()
+    st.stop()
+
+USER: Dict[str, Any] = st.session_state.user
+ROLE: str = USER["role"]
+USER_DC: Optional[str] = USER.get("dc_id")
+
+# =====================================================================
 # DATA (TRAIN vs LIVE OUT-OF-SAMPLE RING BUFFER), MODEL & AGENT
 # =====================================================================
 
@@ -252,6 +308,8 @@ def _month_window(cycle: int) -> Tuple[datetime, int, int]:
     return month_start, days_in_month * 24, offset_hours
 
 
+# Fereastra lunii curente (recalculată după ce citim ciclul din starea comună)
+CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS = _month_window(0)
 # Scală verticală fixă pentru grafic, ca axa să nu "sară" la fiecare tick (ca pe un terminal de bursă)
 Y_AXIS_MAX = float(feed["gross_solar_mw"].max()) * 1.08 + 0.5
 
@@ -272,23 +330,10 @@ if "autoplay" not in st.session_state:
     st.session_state.autoplay = False
 if "pending_advance" not in st.session_state:
     st.session_state.pending_advance = False
-if "dc_history" not in st.session_state:
-    # Istoricul ofertelor per nod; actualizat la fiecare Aprobă / Refuză -> clasamentul se adaptează
-    st.session_state.dc_history = {
-        n["id"]: dict(n.get("history", {"offers_sent": 0, "offers_accepted": 0})) for n in DATACENTERS
-    }
-if "deals" not in st.session_state:
-    # deals[pas][id_datacenter] = MW contractați la pasul respectiv
-    st.session_state.deals = {}
-if "refused" not in st.session_state:
-    # refused[pas] = set cu id-urile datacenter-elor care au refuzat oferta pentru pasul respectiv
-    st.session_state.refused = {}
-if "ring_cycle" not in st.session_state:
-    st.session_state.ring_cycle = 0
 
-_, _init_month_hours, _ = _month_window(int(st.session_state.ring_cycle))
-if "current_step" not in st.session_state:
-    # Pornim cu 2 ore ÎNAINTEA unui vârf de surplus (> 5 MW, PZU < 25), ca prima ofertă să fie pe T+2
+
+def _default_start_step() -> int:
+    """Pornim cu 2 ore ÎNAINTEA unui vârf de surplus, ca prima ofertă (T+2) să apară imediat."""
     candidates = (
         feed[(feed["surplus_mw"] > 5.0) & (feed["day_ahead_price_eur"] < 25.0)]
         if "surplus_mw" in feed.columns
@@ -301,9 +346,32 @@ if "current_step" not in st.session_state:
     else:
         noon = feed[feed["hour"].isin([12, 13])]
         peak_step = int(noon.index[0]) if len(noon) > 0 else 13
-    st.session_state.current_step = int((peak_step - LOOKAHEAD_HOURS) % N_ROWS)
+    return int((peak_step - LOOKAHEAD_HOURS) % N_ROWS)
 
-# Notificările generate în callback-uri sunt afișate la începutul următoarei rulări
+
+@st.cache_resource
+def shared_state() -> Dict[str, Any]:
+    """
+    Starea COMUNĂ tuturor sesiunilor (un singur proces de server): ora curentă din dataset,
+    ofertele acceptate / refuzate și istoricul DC. Așa, când un Data Center apasă Aprobă,
+    dispeceratul PPC vede imediat tranzacția, iar DC-urile văd ora pe care o controlează PPC.
+    """
+    return {
+        "lock": threading.Lock(),
+        "current_step": _default_start_step(),
+        "ring_cycle": 0,
+        # deals[pas][id_datacenter] = MW contractați la pasul respectiv
+        "deals": {},
+        # refused[pas] = id-urile datacenter-elor care au refuzat oferta pentru pasul respectiv
+        "refused": {},
+        # Istoricul ofertelor per nod; actualizat la fiecare Aprobă / Refuză -> clasamentul se adaptează
+        "dc_history": {
+            n["id"]: dict(n.get("history", {"offers_sent": 0, "offers_accepted": 0})) for n in DATACENTERS
+        },
+    }
+
+
+SH: Dict[str, Any] = shared_state()
 
 # Notificările generate în callback-uri sunt afișate la începutul următoarei rulări
 _toast_msg = st.session_state.pop("toast_msg", None)
@@ -313,16 +381,29 @@ if _toast_msg:
 # Avansarea automată în Ring Buffer (când se termină luna curentă la 23:00, trece în ziua 1 ora 00:00 a lunii următoare)
 if st.session_state.pending_advance:
     st.session_state.pending_advance = False
-    _, _cur_month_hours, _ = _month_window(int(st.session_state.ring_cycle))
-    nxt_step = int(st.session_state.current_step) + 1
+    _, _cur_month_hours, _ = _month_window(int(SH["ring_cycle"]))
+    nxt_step = int(SH["current_step"]) + 1
     if nxt_step >= _cur_month_hours:
-        st.session_state.current_step = 0
-        st.session_state.ring_cycle = int(st.session_state.ring_cycle) + 1
+        SH["current_step"] = 0
+        SH["ring_cycle"] = int(SH["ring_cycle"]) + 1
     else:
-        st.session_state.current_step = nxt_step
+        SH["current_step"] = nxt_step
 
-CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS = _month_window(int(st.session_state.ring_cycle))
-st.session_state.current_step = int(min(max(0, int(st.session_state.current_step)), N_ROWS - 1))
+
+def _sync_month_window() -> None:
+    """Recalculează fereastra lunii din starea comună (și pentru rulările parțiale ale fragmentelor)."""
+    global CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS
+    CYCLE_START_DT, N_ROWS, CYCLE_OFFSET_HOURS = _month_window(int(SH["ring_cycle"]))
+    SH["current_step"] = int(min(max(0, int(SH["current_step"])), N_ROWS - 1))
+    # Pagina „Harta Rețea SCADA” citește aceste chei din sesiune: îi dăm aceleași obiecte ca starea comună
+    st.session_state.current_step = SH["current_step"]
+    st.session_state.ring_cycle = SH["ring_cycle"]
+    st.session_state.deals = SH["deals"]
+    st.session_state.refused = SH["refused"]
+    st.session_state.dc_history = SH["dc_history"]
+
+
+_sync_month_window()
 
 agent: VoltComputeAgent = st.session_state.agent
 
@@ -460,7 +541,7 @@ def step_escalated(step: int) -> bool:
 
 def delivered_mw(step: int) -> float:
     """MW deja contractați (acceptați de data centre) la pasul respectiv."""
-    return round(sum(st.session_state.deals.get(step, {}).values()), 3)
+    return round(sum(SH["deals"].get(step, {}).values()), 3)
 
 
 def remaining_surplus(step: int) -> float:
@@ -471,8 +552,8 @@ def remaining_surplus(step: int) -> float:
 def node_open_for_step(step: int, node: Dict[str, Any]) -> bool:
     """Nodul nu a acceptat și nu a refuzat încă oferta pentru acest pas."""
     return (
-        node["id"] not in st.session_state.deals.get(step, {})
-        and node["id"] not in st.session_state.refused.get(step, set())
+        node["id"] not in SH["deals"].get(step, {})
+        and node["id"] not in SH["refused"].get(step, set())
     )
 
 
@@ -488,7 +569,7 @@ def datacenter_snapshot(step: int, node: Dict[str, Any]) -> Optional[Dict[str, A
 
 def delivered_to_node(step: int, node: Dict[str, Any]) -> float:
     """MW livrați nodului la pasul respectiv, după acceptarea ofertei."""
-    return float(st.session_state.deals.get(step, {}).get(node["id"], 0.0))
+    return float(SH["deals"].get(step, {}).get(node["id"], 0.0))
 
 
 def delivered_temperature(step: int, node: Dict[str, Any]) -> Optional[float]:
@@ -541,7 +622,7 @@ def node_ranking(step: int) -> List[Dict[str, Any]]:
         snapshot = datacenter_snapshot(step, node)
         if snapshot is None:
             continue
-        hist = st.session_state.dc_history[node["id"]]
+        hist = SH["dc_history"][node["id"]]
         candidates.append(
             {
                 "id": node["id"],
@@ -585,13 +666,14 @@ def build_offer(steps: List[int]) -> Tuple[Optional[Dict[str, Any]], bool]:
 
 
 def _accept_offer(node_id: str, node_label: str, per_step: Dict[int, float]) -> None:
-    """Callback pentru butonul Acceptă (rulează înaintea scriptului, deci nu se pierde în Play)."""
-    for step, mw in per_step.items():
-        st.session_state.deals.setdefault(step, {})[node_id] = mw
+    """Callback pentru butonul Aprobă (rulează înaintea scriptului, deci nu se pierde în Play)."""
+    with SH["lock"]:
+        for step, mw in per_step.items():
+            SH["deals"].setdefault(step, {})[node_id] = mw
+        hist = SH["dc_history"][node_id]
+        hist["offers_sent"] += 1
+        hist["offers_accepted"] += 1
     st.session_state.pending_advance = False
-    hist = st.session_state.dc_history[node_id]
-    hist["offers_sent"] += 1
-    hist["offers_accepted"] += 1
     total = sum(per_step.values())
     st.session_state.toast_msg = (
         f"✅ Tranzacție aprobată: {node_label} trece în COMPUTING cu {total:.2f} MWh la {FIXED_PRICE_EUR:.0f} €/MWh."
@@ -600,9 +682,10 @@ def _accept_offer(node_id: str, node_label: str, per_step: Dict[int, float]) -> 
 
 def _refuse_offer(node_id: str, node_label: str, per_step: Dict[int, float]) -> None:
     """Callback pentru butonul Refuză: oferta trece la următorul data center disponibil."""
-    for step in per_step:
-        st.session_state.refused.setdefault(step, set()).add(node_id)
-    st.session_state.dc_history[node_id]["offers_sent"] += 1
+    with SH["lock"]:
+        for step in per_step:
+            SH["refused"].setdefault(step, set()).add(node_id)
+        SH["dc_history"][node_id]["offers_sent"] += 1
     st.session_state.pending_advance = False
     st.session_state.toast_msg = (
         f"⛔ {node_label} a refuzat. Tariful rămâne {FIXED_PRICE_EUR:.0f} €/MWh — oferta sare la următorul nod."
@@ -618,12 +701,12 @@ def _reset_offers(steps: List[int]) -> None:
     efectul lor asupra istoricului de acceptare, ca Match Score-ul să revină la valoarea anterioară.
     """
     for step in steps:
-        for node_id in st.session_state.deals.pop(step, {}):
-            hist = st.session_state.dc_history[node_id]
+        for node_id in SH["deals"].pop(step, {}):
+            hist = SH["dc_history"][node_id]
             hist["offers_sent"] = max(0, hist["offers_sent"] - 1)
             hist["offers_accepted"] = max(0, hist["offers_accepted"] - 1)
-        for node_id in st.session_state.refused.pop(step, set()):
-            hist = st.session_state.dc_history[node_id]
+        for node_id in SH["refused"].pop(step, set()):
+            hist = SH["dc_history"][node_id]
             hist["offers_sent"] = max(0, hist["offers_sent"] - 1)
     st.session_state.pending_advance = False
     st.session_state.toast_msg = "↩️ Ofertele pentru interval au fost resetate (istoricul DC restaurat)."
@@ -632,192 +715,204 @@ def _reset_offers(steps: List[int]) -> None:
 def _step_back() -> None:
     """Pas Înapoi: revine cu o oră (trece din 00:00 în 23:00 a ciclului anterior)."""
     st.session_state.autoplay = False
-    prv = int(st.session_state.current_step) - 1
+    prv = int(SH["current_step"]) - 1
     if prv < 0:
-        prev_cycle = int(st.session_state.ring_cycle) - 1
+        prev_cycle = int(SH["ring_cycle"]) - 1
         _, prev_month_hours, _ = _month_window(prev_cycle)
-        st.session_state.ring_cycle = prev_cycle
-        st.session_state.current_step = prev_month_hours - 1
+        SH["ring_cycle"] = prev_cycle
+        SH["current_step"] = prev_month_hours - 1
     else:
-        st.session_state.current_step = prv
+        SH["current_step"] = prv
 
 
 def _next_hour() -> None:
     """Pas Înainte / Simulează Ora Următoare: avansează o oră (Ring Buffer, 23:00 -> 00:00 fără oprire)."""
     st.session_state.autoplay = False
-    _, cur_month_hours, _ = _month_window(int(st.session_state.ring_cycle))
-    nxt = int(st.session_state.current_step) + 1
+    _, cur_month_hours, _ = _month_window(int(SH["ring_cycle"]))
+    nxt = int(SH["current_step"]) + 1
     if nxt >= cur_month_hours:
-        st.session_state.current_step = 0
-        st.session_state.ring_cycle = int(st.session_state.ring_cycle) + 1
+        SH["current_step"] = 0
+        SH["ring_cycle"] = int(SH["ring_cycle"]) + 1
     else:
-        st.session_state.current_step = nxt
+        SH["current_step"] = nxt
 
 
 def _toggle_play() -> None:
     st.session_state.autoplay = not st.session_state.autoplay
 
 
-abs_T = CYCLE_OFFSET_HOURS + int(st.session_state.current_step)
-# Calculăm eroarea MAE live pe ultimele 24h (doar orele de zi cu activitate solară) pentru afișare transparentă
-_day_hist_errors = [
-    abs(net_injection_mw(i) - predict_step(i)[3])
-    for i in range(abs_T - HISTORY_HOURS, abs_T + 1)
-    if 7 <= int(_ring_row(i)["hour"]) <= 18
-]
-live_window_mae = float(np.mean(_day_hist_errors)) if _day_hist_errors else 0.42
-
-hdr_main, hdr_map_btn = st.columns([5.6, 1.4], gap="small")
-with hdr_main:
-    st.markdown(
-        f"""
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-  <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH</div>
-  <div class="vc-sub">LUNA CURENTĂ: {CYCLE_START_DT.strftime('%Y-%m')} (Windows API) · {N_ROWS}h în lună (Luna #{int(st.session_state.ring_cycle) + 1}) · MAE Live (24h): ±{live_window_mae:.2f} MW</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-with hdr_map_btn:
-    st.page_link("pages/1_Harta_Retea_SCADA.py", label="🗺️ Harta Rețea SCADA", width="stretch")
-
-current_cycle = int(st.session_state.ring_cycle)
-slider_key = f"timeline_slider_{current_cycle}"
-st.session_state[slider_key] = int(st.session_state.current_step)
-
-
 def _on_slider_change(s_key: str) -> None:
     st.session_state.autoplay = False
-    st.session_state.current_step = int(st.session_state[s_key])
+    SH["current_step"] = int(st.session_state[s_key])
 
 
-bar_back, bar_fwd, bar_play, bar_slider = st.columns([1, 1.5, 1.5, 4.5], gap="small")
-bar_back.button(
-    "◀ Pas Înapoi",
-    on_click=_step_back,
-    width="stretch",
-    help="Revino cu o oră în dataset (oprește Live Feed).",
-)
-bar_fwd.button(
-    "⏭ Simulează Ora Următoare",
-    on_click=_next_hour,
-    type="primary",
-    width="stretch",
-    help="Pas Înainte: avansează o oră în telemetria din fișiere.",
-)
-bar_play.button(
-    "⏹ Stop Live Feed" if st.session_state.autoplay else "▶▶ Play Live Feed",
-    on_click=_toggle_play,
-    width="stretch",
-    help=(
-        f"Avansează automat câte o oră la fiecare {AUTOPLAY_SECONDS:.0f}s. Se oprește singur când "
-        "apare o ofertă care cere decizia dispecerului (Aprobă / Refuză)."
-    ),
-)
-with bar_slider:
-    st.select_slider(
-        "Timeline",
-        options=list(range(N_ROWS)),
-        key=slider_key,
-        on_change=_on_slider_change,
-        args=(slider_key,),
-        format_func=lambda i, off=CYCLE_OFFSET_HOURS: _ring_dt(off + int(i)).strftime("%Y-%m-%d %H:%M"),
-        label_visibility="collapsed",
-        help="Sari direct la orice oră din setul de date live (out-of-sample).",
+def render_ppc_header() -> None:
+    """Titlu + bara de control temporal (doar dispeceratul PPC controlează ora din dataset)."""
+    abs_T = CYCLE_OFFSET_HOURS + int(SH["current_step"])
+    # Calculăm eroarea MAE live pe ultimele 24h (doar orele de zi cu activitate solară) pentru afișare transparentă
+    _day_hist_errors = [
+        abs(net_injection_mw(i) - predict_step(i)[3])
+        for i in range(abs_T - HISTORY_HOURS, abs_T + 1)
+        if 7 <= int(_ring_row(i)["hour"]) <= 18
+    ]
+    live_window_mae = float(np.mean(_day_hist_errors)) if _day_hist_errors else 0.42
+
+    hdr_main, hdr_map_btn = st.columns([5.6, 1.4], gap="small")
+    with hdr_main:
+        st.markdown(
+            f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // PPC GRID DISPATCH</div>
+      <div class="vc-sub">👤 {USER["display_name"]}</div>
+      <div class="vc-sub">LUNA CURENTĂ: {CYCLE_START_DT.strftime('%Y-%m')} (Windows API) · {N_ROWS}h în lună (Luna #{int(SH["ring_cycle"]) + 1}) · MAE Live (24h): ±{live_window_mae:.2f} MW</div>
+    </div>
+    """,
+            unsafe_allow_html=True,
+        )
+    with hdr_map_btn:
+        st.page_link("pages/1_Harta_Retea_SCADA.py", label="🗺️ Harta Rețea SCADA", width="stretch")
+
+    slider_key = f"timeline_slider_{int(SH['ring_cycle'])}"
+    st.session_state[slider_key] = int(SH["current_step"])  # sliderul arată mereu ora comună
+
+    bar_back, bar_fwd, bar_play, bar_slider = st.columns([1, 1.5, 1.5, 4.5], gap="small")
+    bar_back.button(
+        "◀ Pas Înapoi",
+        on_click=_step_back,
+        width="stretch",
+        help="Revino cu o oră în dataset (oprește Live Feed).",
     )
-
-# =====================================================================
-# STATE AT STEP T + LOOKAHEAD (IN RING BUFFER)
-# =====================================================================
-T = CYCLE_OFFSET_HOURS + int(st.session_state.current_step)
-row_T = _ring_row(T)
-dt_T = _ring_dt(T)
-surplus_T, conf_T, shap_T, pred_inj_T = predict_step(T)
-
-delivered_T = delivered_mw(T)
-revenue_T = round(delivered_T * FIXED_PRICE_EUR, 2)  # profit PPC (apare DOAR în interfața PPC)
-is_dispatched = delivered_T > 0.01
-
-# Profitul PPC se contabilizează la contractare și rămâne cumulat (nu dispare când trece ora)
-cumulative_profit = sum(delivered_mw(step) * FIXED_PRICE_EUR for step in st.session_state.deals)
-
-# Curentul real (injecția netă măsurată în teren) vs predicția AI și după dispecerizare
-raw_injection_T = net_injection_mw(T)
-actual_injection_T = max(0.0, raw_injection_T - delivered_T)
-grid_limit_mw = float(row_T.get("grid_capacity_limit_mw", 10.0))
-actual_surplus_T = max(0.0, actual_injection_T - grid_limit_mw) if is_dispatched else surplus_T
-
-future_idx = [T + k for k in range(1, LOOKAHEAD_HOURS + 1)]
-future_surplus = {i: predict_step(i)[0] for i in future_idx}
-
-# Ora țintă = T+2. La fiecare oră nouă se ofertează DOAR ora T+2, pe baza predicției făcute acum.
-# Fiecare oră țintă pornește cu 0 oferte; oferta merge la un singur DC o dată (în ordinea clasamentului).
-target_idx = T + LOOKAHEAD_HOURS
-target_str = _ring_dt(target_idx).strftime("%H:%M")
-start_str = _ring_dt(target_idx).strftime("%H:%M")
-end_str = _ring_dt(target_idx + 1).strftime("%H:%M")
-target_pred_mw, target_conf, _, _ = predict_step(target_idx)
-target_contracted_mw = delivered_mw(target_idx)
-target_remaining_mw = max(0.0, target_pred_mw - target_contracted_mw)
-
-# FEREASTRA DE OFERTARE (2 ore): când la ora T modelul prezice surplus de arbitraj pentru H = T+2,
-# oferta pentru H apare imediat ca notificare și rămâne deschisă 2 ore (la T = H-2 și T = H-1).
-# Când ora H ajunge pe grafic (T = H), oferta expiră. Fiecare oră țintă pornește cu 0 oferte.
-open_targets = [h for h in range(T + 1, T + LOOKAHEAD_HOURS + 1) if step_qualifies(h)]
-offers_by_target = {h: build_offer([h]) for h in open_targets}  # h -> (ofertă curentă, epuizat)
-pending_offers = {h: o for h, (o, _) in offers_by_target.items() if o is not None}
-exhausted_targets = [h for h, (o, ex) in offers_by_target.items() if o is None and ex]
-offer_steps = open_targets
-offer = pending_offers[min(pending_offers)] if pending_offers else None  # cea mai urgentă ofertă
-pending_node_ids = {o["node"]["id"] for o in pending_offers.values()}
-table_steps = open_targets if open_targets else [target_idx]
-if open_targets:
-    start_str = _ring_dt(min(open_targets)).strftime("%H:%M")
-    end_str = _ring_dt(max(open_targets) + 1).strftime("%H:%M")
-# Starea pool-ului de ofertare (ALL_DCS_EXHAUSTED = au refuzat toate nodurile eligibile)
-pool_status = POOL_ALL_DCS_EXHAUSTED if exhausted_targets else None
-
-uncertain_steps = [h for h in future_idx if step_uncertain(h)]
-escalated_steps = [h for h in future_idx if step_escalated(h)]
-
-peak_candidates = [(T, surplus_T)] + [(i, s) for i, s in future_surplus.items()]
-peak_idx, peak_mw = max(peak_candidates, key=lambda x: x[1])
-
-if is_dispatched:
-    alert_html = (
-        f'<div class="vc-alert vc-alert-green">✅ REȚEA STABILIZATĂ: {delivered_T:.2f} MW de surplus '
-        f'au fost preluați de data centre la {dt_T.strftime("%H:%M")}. '
-        f'Curentul a scăzut de la {raw_injection_T:.2f} MW la {actual_injection_T:.2f} MW · '
-        f'Profit PPC: +{revenue_T:,.2f} €</div>'
+    bar_fwd.button(
+        "⏭ Simulează Ora Următoare",
+        on_click=_next_hour,
+        type="primary",
+        width="stretch",
+        help="Pas Înainte: avansează o oră în telemetria din fișiere.",
     )
-elif pool_status == POOL_ALL_DCS_EXHAUSTED:
-    alert_html = (
-        '<div class="vc-alert vc-alert-red">🚫 ALL_DCS_EXHAUSTED: toate data centerele eligibile au refuzat '
-        f'oferta la {FIXED_PRICE_EUR:.0f} €/MWh. Se solicită intervenția dispeceratului; riscul de curtailment rămâne.</div>'
+    bar_play.button(
+        "⏹ Stop Live Feed" if st.session_state.autoplay else "▶▶ Play Live Feed",
+        on_click=_toggle_play,
+        width="stretch",
+        help=(
+            f"Avansează automat câte o oră la fiecare {AUTOPLAY_SECONDS:.0f}s. Se oprește singur când "
+            "apare o ofertă care cere decizia dispecerului (Aprobă / Refuză)."
+        ),
     )
-elif uncertain_steps:
-    u = uncertain_steps[0]
-    alert_html = (
-        f'<div class="vc-alert vc-alert-amber">❓ STATUS: UNCERTAIN la {_ring_dt(u).strftime("%H:%M")} — senzori cu '
-        f'valori anormale (&gt; 3σ): {"; ".join(step_anomalies(u))}. Alocarea automată este suspendată, '
-        f'operatorul uman a fost notificat.</div>'
-    )
-elif escalated_steps:
-    e = escalated_steps[0]
-    alert_html = (
-        f'<div class="vc-alert vc-alert-amber">🧑‍💼 ESCALATE_TO_HUMAN la {_ring_dt(e).strftime("%H:%M")}: '
-        f'confidența modelului ({predict_step(e)[1] * 100:.0f}%) este sub pragul de '
-        f'{agent.CONFIDENCE_THRESHOLD * 100:.0f}%. Decizia rămâne la dispecer.</div>'
-    )
-else:
-    alert_html = ""  # Rețea în parametri normali: nu afișăm niciun banner
+    with bar_slider:
+        st.select_slider(
+            "Timeline",
+            options=list(range(N_ROWS)),
+            key=slider_key,
+            on_change=_on_slider_change,
+            args=(slider_key,),
+            format_func=lambda i, off=CYCLE_OFFSET_HOURS: _ring_dt(off + int(i)).strftime("%Y-%m-%d %H:%M"),
+            label_visibility="collapsed",
+            help="Sari direct la orice oră din setul de date live (out-of-sample).",
+        )
+    st.button("Ieșire din cont", key="logout_ppc", on_click=_do_logout)
 
-col_ppc, col_dc = st.columns([0.72, 0.28], gap="large")
+
+def compute_state() -> None:
+    """Calculează starea la ora T (din starea comună): predicții, ofertele deschise pentru T+2, alerte."""
+    global T, _, actual_injection_T, actual_surplus_T, alert_html, conf_T, cumulative_profit, delivered_T
+    global dt_T, e, end_str, escalated_steps, exhausted_targets, future_idx, future_surplus, grid_limit_mw
+    global is_dispatched, offer, offer_steps, offers_by_target, open_targets, peak_candidates, peak_idx
+    global peak_mw, pending_node_ids, pending_offers, pool_status, pred_inj_T, raw_injection_T, revenue_T
+    global row_T, shap_T, start_str, surplus_T, table_steps, target_conf, target_contracted_mw, target_idx
+    global target_pred_mw, target_remaining_mw, target_str, u, uncertain_steps
+    # =====================================================================
+    # STATE AT STEP T + LOOKAHEAD (IN RING BUFFER)
+    # =====================================================================
+    _sync_month_window()
+    T = CYCLE_OFFSET_HOURS + int(SH["current_step"])
+    row_T = _ring_row(T)
+    dt_T = _ring_dt(T)
+    surplus_T, conf_T, shap_T, pred_inj_T = predict_step(T)
+
+    delivered_T = delivered_mw(T)
+    revenue_T = round(delivered_T * FIXED_PRICE_EUR, 2)  # profit PPC (apare DOAR în interfața PPC)
+    is_dispatched = delivered_T > 0.01
+
+    # Profitul PPC se contabilizează la contractare și rămâne cumulat (nu dispare când trece ora)
+    cumulative_profit = sum(delivered_mw(step) * FIXED_PRICE_EUR for step in SH["deals"])
+
+    # Curentul real (injecția netă măsurată în teren) vs predicția AI și după dispecerizare
+    raw_injection_T = net_injection_mw(T)
+    actual_injection_T = max(0.0, raw_injection_T - delivered_T)
+    grid_limit_mw = float(row_T.get("grid_capacity_limit_mw", 10.0))
+    actual_surplus_T = max(0.0, actual_injection_T - grid_limit_mw) if is_dispatched else surplus_T
+
+    future_idx = [T + k for k in range(1, LOOKAHEAD_HOURS + 1)]
+    future_surplus = {i: predict_step(i)[0] for i in future_idx}
+
+    # Ora țintă = T+2. La fiecare oră nouă se ofertează DOAR ora T+2, pe baza predicției făcute acum.
+    # Fiecare oră țintă pornește cu 0 oferte; oferta merge la un singur DC o dată (în ordinea clasamentului).
+    target_idx = T + LOOKAHEAD_HOURS
+    target_str = _ring_dt(target_idx).strftime("%H:%M")
+    start_str = _ring_dt(target_idx).strftime("%H:%M")
+    end_str = _ring_dt(target_idx + 1).strftime("%H:%M")
+    target_pred_mw, target_conf, _, _ = predict_step(target_idx)
+    target_contracted_mw = delivered_mw(target_idx)
+    target_remaining_mw = max(0.0, target_pred_mw - target_contracted_mw)
+
+    # OFERTARE STRICT LA T+2: la ora T se ofertează DOAR ora H = T+2 (predicția cu 2 ore înainte).
+    # Nu există oferte cu 1 oră înainte: la ora următoare oferta pentru H dispare, chiar dacă nu s-a
+    # răspuns (ce s-a contractat rămâne). Fiecare oră țintă pornește cu 0 oferte.
+    open_targets = [T + LOOKAHEAD_HOURS] if step_qualifies(T + LOOKAHEAD_HOURS) else []
+    offers_by_target = {h: build_offer([h]) for h in open_targets}  # h -> (ofertă curentă, epuizat)
+    pending_offers = {h: o for h, (o, _) in offers_by_target.items() if o is not None}
+    exhausted_targets = [h for h, (o, ex) in offers_by_target.items() if o is None and ex]
+    offer_steps = open_targets
+    offer = pending_offers[min(pending_offers)] if pending_offers else None  # cea mai urgentă ofertă
+    pending_node_ids = {o["node"]["id"] for o in pending_offers.values()}
+    table_steps = open_targets if open_targets else [target_idx]
+    if open_targets:
+        start_str = _ring_dt(min(open_targets)).strftime("%H:%M")
+        end_str = _ring_dt(max(open_targets) + 1).strftime("%H:%M")
+    # Starea pool-ului de ofertare (ALL_DCS_EXHAUSTED = au refuzat toate nodurile eligibile)
+    pool_status = POOL_ALL_DCS_EXHAUSTED if exhausted_targets else None
+
+    uncertain_steps = [h for h in future_idx if step_uncertain(h)]
+    escalated_steps = [h for h in future_idx if step_escalated(h)]
+
+    peak_candidates = [(T, surplus_T)] + [(i, s) for i, s in future_surplus.items()]
+    peak_idx, peak_mw = max(peak_candidates, key=lambda x: x[1])
+
+    if is_dispatched:
+        alert_html = (
+            f'<div class="vc-alert vc-alert-green">✅ REȚEA STABILIZATĂ: {delivered_T:.2f} MW de surplus '
+            f'au fost preluați de data centre la {dt_T.strftime("%H:%M")}. '
+            f'Curentul a scăzut de la {raw_injection_T:.2f} MW la {actual_injection_T:.2f} MW · '
+            f'Profit PPC: +{revenue_T:,.2f} €</div>'
+        )
+    elif pool_status == POOL_ALL_DCS_EXHAUSTED:
+        alert_html = (
+            '<div class="vc-alert vc-alert-red">🚫 ALL_DCS_EXHAUSTED: toate data centerele eligibile au refuzat '
+            f'oferta la {FIXED_PRICE_EUR:.0f} €/MWh. Se solicită intervenția dispeceratului; riscul de curtailment rămâne.</div>'
+        )
+    elif uncertain_steps:
+        u = uncertain_steps[0]
+        alert_html = (
+            f'<div class="vc-alert vc-alert-amber">❓ STATUS: UNCERTAIN la {_ring_dt(u).strftime("%H:%M")} — senzori cu '
+            f'valori anormale (&gt; 3σ): {"; ".join(step_anomalies(u))}. Alocarea automată este suspendată, '
+            f'operatorul uman a fost notificat.</div>'
+        )
+    elif escalated_steps:
+        e = escalated_steps[0]
+        alert_html = (
+            f'<div class="vc-alert vc-alert-amber">🧑‍💼 ESCALATE_TO_HUMAN la {_ring_dt(e).strftime("%H:%M")}: '
+            f'confidența modelului ({predict_step(e)[1] * 100:.0f}%) este sub pragul de '
+            f'{agent.CONFIDENCE_THRESHOLD * 100:.0f}%. Decizia rămâne la dispecer.</div>'
+        )
+    else:
+        alert_html = ""  # Rețea în parametri normali: nu afișăm niciun banner
+
 
 # =====================================================================
 # STÂNGA: INTERFAȚA PPC (dispecerat, profit, grafic, tabel)
 # =====================================================================
-with col_ppc:
+def render_ppc() -> None:
+    """Ecranul PPC: alerte, metrici, grafic (real vs predicție vs limită) și tabelul de arbitraj."""
     st.markdown('<span id="vc-split-marker"></span>', unsafe_allow_html=True)
     # Slot fix pentru banner: când apare/dispare, restul elementelor NU își schimbă poziția
     alert_slot = st.empty()
@@ -1010,9 +1105,9 @@ with col_ppc:
     def node_status(node: Dict[str, Any]) -> str:
         if any(datacenter_snapshot(s, node) is None for s in table_steps):
             return "NO_TELEMETRY"
-        if any(node["id"] in st.session_state.deals.get(s, {}) for s in table_steps):
+        if any(node["id"] in SH["deals"].get(s, {}) for s in table_steps):
             return "COMPUTING"
-        if any(node["id"] in st.session_state.refused.get(s, set()) for s in table_steps):
+        if any(node["id"] in SH["refused"].get(s, set()) for s in table_steps):
             return "REJECTED"
         if any(thermal_rejected(s, node) for s in table_steps):
             return "INELIGIBLE_HVAC"
@@ -1039,13 +1134,13 @@ with col_ppc:
     for node in DATACENTERS:
         table_snapshot = datacenter_snapshot(table_steps[0], node)
         contracted = round(
-            sum(st.session_state.deals.get(s, {}).get(node["id"], 0.0) for s in table_steps), 2
+            sum(SH["deals"].get(s, {}).get(node["id"], 0.0) for s in table_steps), 2
         )
         pending_mwh = round(
             sum(o["total_mwh"] for o in pending_offers.values() if o["node"]["id"] == node["id"]), 2
         )
         # Profit / economie: cumulat din TOATE orele contractate (nu dispare când trece ora)
-        total_contracted = sum(d.get(node["id"], 0.0) for d in st.session_state.deals.values())
+        total_contracted = sum(d.get(node["id"], 0.0) for d in SH["deals"].values())
         current_temp = delivered_temperature(table_steps[0], node)
         if current_temp is None:
             current_temp = float("nan")
@@ -1074,7 +1169,7 @@ with col_ppc:
 
     st.markdown(
         '<div class="vc-sub" style="margin:4px 0;">ARBITRAJ MULTI-NOD · '
-        + f"FEREASTRĂ DE OFERTARE: {start_str} – {end_str}"
+        + f"OFERTĂ PENTRU ORA (T+2): {start_str} – {end_str}"
         + "</div>",
         unsafe_allow_html=True,
     )
@@ -1110,167 +1205,172 @@ with col_ppc:
     )
 
 # =====================================================================
-# DREAPTA: ④ ACT — carduri Data Center + Human-in-the-Loop (Aprobă / Refuză)
+# ECRANUL DATA CENTER: doar ofertele adresate acestui DC + contractele lui
 # =====================================================================
-with col_dc:
+def render_dc(dc_id: str) -> None:
+    node = DC_BY_ID[dc_id]
+    savings_per_mwh = REFERENCE_TARIFF_EUR - FIXED_PRICE_EUR
+
     st.markdown(
-        '<span id="vc-dc-marker"></span>'
-        '<div class="vc-pane-head vc-pane-dc">④ ACT · DATA CENTERS</div>'
-        f'<div class="vc-pane-sub">Pool routing la tarif FIX {FIXED_PRICE_EUR:.0f} €/MWh · refuzul nu scade prețul</div>',
+        f"""
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+  <div class="vc-title"><span class="vc-live"></span>VOLTCOMPUTE // {node['name'].upper()}</div>
+  <div class="vc-sub">👤 {USER["display_name"]} · ORA CURENTĂ: <b style="color:#E5E7EB;">{dt_T.strftime("%a %d %b · %H:%M")}</b></div>
+</div>
+""",
         unsafe_allow_html=True,
     )
 
-    savings_per_mwh = REFERENCE_TARIFF_EUR - FIXED_PRICE_EUR
+    col_offer, col_info = st.columns([0.55, 0.45], gap="large")
 
-    # Sloturi fixe (câte unul pentru fiecare oră din fereastra de 2 ore + unul pentru „fără ofertă”):
-    # pozițiile elementelor nu se schimbă între rulări, deci nu rămân carduri/butoane „fantomă”.
-    offer_slots = [st.empty() for _ in range(LOOKAHEAD_HOURS)]
-    no_offer_slot = st.empty()
-    for slot_i in range(len(open_targets), LOOKAHEAD_HOURS):
-        offer_slots[slot_i].empty()
-
-    for slot_i, h in enumerate(sorted(open_targets)):
-        with offer_slots[slot_i].container():
-            h_offer, h_exhausted = offers_by_target[h]
+    # ---------- Ofertele active pentru acest DC ----------
+    with col_offer:
+        st.markdown(
+            '<div class="vc-pane-head vc-pane-dc">OFERTE PENTRU VOI</div>'
+            f'<div class="vc-pane-sub">Energie verde din surplusul solar PPC · tarif fix {FIXED_PRICE_EUR:.0f} €/MWh '
+            f"(vs {REFERENCE_TARIFF_EUR:.0f} €/MWh standard) · oferta e valabilă doar în ora curentă</div>",
+            unsafe_allow_html=True,
+        )
+        # Sloturi fixe: pozițiile elementelor nu se schimbă între rulări (fără „fantome”)
+        offer_slot = st.empty()
+        my_offers = [(h, o) for h, o in sorted(pending_offers.items()) if o["node"]["id"] == dc_id]
+        if my_offers:
+            h, h_offer = my_offers[0]
             h_label = f"{_ring_dt(h).strftime('%H:%M')} – {_ring_dt(h + 1).strftime('%H:%M')}"
-            hours_left = h - T  # 2 = oferta tocmai a apărut, 1 = ultima oră pentru decizie
-            expiry_txt = (
-                "expiră peste 1 oră — ultima oră pentru decizie" if hours_left == 1 else f"expiră peste {hours_left} ore"
-            )
-            h_responded = bool(st.session_state.deals.get(h) or st.session_state.refused.get(h))
-
-            if h_offer is not None:
-                node = h_offer["node"]
-                per_step = h_offer["per_step"]
-                total_mwh = h_offer["total_mwh"]
-                queue_after = [
-                    DC_BY_ID[r["id"]]["short"]
-                    for r in node_ranking(h)
-                    if r["eligible"] and r["id"] != node["id"] and node_open_for_step(h, DC_BY_ID[r["id"]])
-                ]
-                queue_txt = " → ".join(queue_after) if queue_after else "niciun alt nod (→ ALL_DCS_EXHAUSTED)"
+            total_mwh = h_offer["total_mwh"]
+            with offer_slot.container():
                 st.markdown(
                     f"""
-    <div class="vc-modal" style="border:1px solid rgba(245,158,11,0.6);">
-      <div class="vc-modal-head">🔔 OFERTĂ PENTRU ORA {h_label} · {expiry_txt.upper()}</div>
-      <div class="vc-modal-title">{node['name']} (Match Score {h_offer['match_score']:.3f})</div>
-      <div class="vc-modal-body">
-        Modelul prezice <span class="vc-mono">{predict_step(h)[0]:.2f} MW</span> peste linie la {_ring_dt(h).strftime('%H:%M')}.
-        Oferta: <span class="vc-mono" style="color:#00FF9D;">{total_mwh:.2f} MWh</span> la tariful fix
-        <span class="vc-mono" style="color:#00FF9D;">{FIXED_PRICE_EUR:.0f} €/MWh</span>
-        (vs {REFERENCE_TARIFF_EUR:.0f} €/MWh tarif standard).
-        <br>💶 Venit PPC: <span class="vc-mono">{total_mwh * FIXED_PRICE_EUR:,.2f} €</span>
-        · Economie DC: <span class="vc-mono">{total_mwh * savings_per_mwh:,.2f} €</span>
-        <br><span style="color:#8E95A5;font-size:0.8rem;">La refuz, aceeași ofertă (același preț) pleacă la: {queue_txt}</span>
-      </div>
-    </div>
-    """,
-                    unsafe_allow_html=True,
-                )
-                btn_accept, btn_refuse = st.columns(2)
-                btn_accept.button(
-                    "✅ Aprobă Tranzacția",
-                    key=f"offer_accept_{h}",  # cheie stabilă pe toată fereastra de 2 ore a orei țintă
-                    type="primary",
-                    width="stretch",
-                    on_click=_accept_offer,
-                    args=(node["id"], node["short"], dict(per_step)),
-                )
-                btn_refuse.button(
-                    "⛔ Refuză Oferta",
-                    key=f"offer_refuse_{h}",
-                    width="stretch",
-                    on_click=_refuse_offer,
-                    args=(node["id"], node["short"], dict(per_step)),
-                )
-                if h_responded:
-                    st.button(
-                        "↩️ Resetează ofertele",
-                        key=f"offer_reset_pending_{h}",
-                        width="stretch",
-                        on_click=_reset_offers,
-                        args=([h],),
-                        help="Anulează răspunsurile deja date pentru această oră.",
-                    )
-
-            elif h_exhausted:
-                st.markdown(
-                    f"""
-    <div class="vc-modal" style="border:1px solid rgba(255,75,75,0.6);">
-      <div class="vc-modal-head" style="color:#FF7B7B;">🚫 ALL_DCS_EXHAUSTED · ORA {h_label}</div>
-      <div class="vc-modal-body">
-        Niciun Data Center eligibil nu mai poate prelua oferta la {FIXED_PRICE_EUR:.0f} €/MWh.
-        <span class="vc-mono" style="color:#FF7B7B;">{remaining_surplus(h):.2f} MWh</span> rămân necontractați —
-        se solicită intervenția dispeceratului ({expiry_txt}).
-      </div>
-    </div>
-    """,
-                    unsafe_allow_html=True,
-                )
-                st.button(
-                    "↩️ Resetează ofertele",
-                    key=f"offer_reset_exhausted_{h}",
-                    width="stretch",
-                    on_click=_reset_offers,
-                    args=([h],),
-                    help="Anulează refuzurile/acceptările pentru această oră și reia ofertarea de la primul clasat.",
-                )
-
-            else:
-                contracted_total = sum(st.session_state.deals.get(h, {}).values())
-                st.markdown(
-                    f"""
-    <div class="vc-modal" style="border:1px solid rgba(0,255,157,0.5);">
-      <div class="vc-modal-head" style="color:#00FF9D;">✅ SURPLUS ALOCAT INTEGRAL · ORA {h_label}</div>
-      <div class="vc-modal-body">
-        {contracted_total:.2f} MWh contractați la {FIXED_PRICE_EUR:.0f} €/MWh ·
-        venit PPC {contracted_total * FIXED_PRICE_EUR:,.2f} €.
-      </div>
-    </div>
-    """,
-                    unsafe_allow_html=True,
-                )
-                st.button(
-                    "↩️ Resetează ofertele",
-                    key=f"offer_reset_done_{h}",
-                    width="stretch",
-                    on_click=_reset_offers,
-                    args=([h],),
-                    help="Anulează tranzacțiile pentru această oră și reia ofertarea de la primul clasat.",
-                )
-
-    if open_targets:
-        no_offer_slot.empty()
-    else:
-        no_offer_slot.markdown(
-            f"""
-<div class="vc-modal">
-  <div class="vc-modal-head">⚡ FĂRĂ OFERTĂ</div>
+<div class="vc-modal" style="border:1px solid rgba(245,158,11,0.6);">
+  <div class="vc-modal-head">🔔 OFERTĂ NOUĂ · ORA {h_label} · VALABILĂ DOAR ACUM</div>
+  <div class="vc-modal-title">{total_mwh:.2f} MWh energie verde la {FIXED_PRICE_EUR:.0f} €/MWh</div>
   <div class="vc-modal-body">
-    Modelul nu prezice nicio depășire a liniei de 10 MW în următoarele {LOOKAHEAD_HOURS} ore.
+    💶 Plătiți: <span class="vc-mono">{total_mwh * FIXED_PRICE_EUR:,.2f} €</span>
+    <span style="color:#8E95A5;">(la tariful standard: {total_mwh * REFERENCE_TARIFF_EUR:,.2f} €)</span>
+    <br>💚 Economisiți: <span class="vc-mono" style="color:#00FF9D;">{total_mwh * savings_per_mwh:,.2f} €</span>
   </div>
 </div>
 """,
-            unsafe_allow_html=True,
-        )
+                    unsafe_allow_html=True,
+                )
+                b_acc, b_ref = st.columns(2)
+                b_acc.button(
+                    "✅ Aprobă Tranzacția",
+                    key=f"dc_accept_{h}",
+                    type="primary",
+                    width="stretch",
+                    on_click=_accept_offer,
+                    args=(dc_id, node["short"], dict(h_offer["per_step"])),
+                )
+                b_ref.button(
+                    "⛔ Refuză Oferta",
+                    key=f"dc_refuse_{h}",
+                    width="stretch",
+                    on_click=_refuse_offer,
+                    args=(dc_id, node["short"], dict(h_offer["per_step"])),
+                )
+        else:
+            tgt = T + LOOKAHEAD_HOURS
+            mine = SH["deals"].get(tgt, {}).get(dc_id, 0.0)
+            refused_now = dc_id in SH["refused"].get(tgt, set())
+            if mine > 0.0:
+                msg = f"✅ Ați acceptat {mine:.2f} MWh pentru ora {_ring_dt(tgt).strftime('%H:%M')}."
+            elif refused_now:
+                msg = f"⛔ Ați refuzat oferta pentru ora {_ring_dt(tgt).strftime('%H:%M')}."
+            else:
+                msg = "Nu aveți nicio ofertă activă în acest moment. Ofertele noi apar automat aici."
+            offer_slot.markdown(
+                f'<div class="vc-modal"><div class="vc-modal-head">⚡ FĂRĂ OFERTĂ ACTIVĂ</div>'
+                f'<div class="vc-modal-body">{msg}</div></div>',
+                unsafe_allow_html=True,
+            )
+        st.button("Ieșire din cont", key="logout_dc", on_click=_do_logout)
+
+    # ---------- Telemetria proprie + contractele DC-ului ----------
+    with col_info:
+        snap = datacenter_snapshot(T, node)
+        k1, k2 = st.columns(2)
+        if snap is not None:
+            k1.metric("Temperatură servere", f"{float(delivered_temperature(T, node)):.1f} °C",
+                      f"limită HVAC {HVAC_LIMIT_C:.0f} °C", delta_color="off")
+            k2.metric("Capacitate liberă", f"{node_free_capacity(T, node):.2f} MW", delta_color="off")
+
+        rows = []
+        for step in sorted(SH["deals"]):
+            mw = SH["deals"][step].get(dc_id, 0.0)
+            if mw <= 0.0:
+                continue
+            rows.append(
+                {
+                    "Ora livrare": _ring_dt(step).strftime("%d %b %H:%M"),
+                    "MWh": mw,
+                    "Cost (€)": round(mw * FIXED_PRICE_EUR, 2),
+                    "Economie (€)": round(mw * savings_per_mwh, 2),
+                    "Stare": "LIVRAT" if step <= T else "PROGRAMAT",
+                }
+            )
+        total_mwh_all = sum(r["MWh"] for r in rows)
+        k3, k4 = st.columns(2)
+        k3.metric("Energie verde contractată", f"{total_mwh_all:.2f} MWh")
+        k4.metric("Economie totală", f"{total_mwh_all * savings_per_mwh:,.2f} €")
+        st.markdown('<div class="vc-sub" style="margin:6px 0;">CONTRACTELE MELE</div>', unsafe_allow_html=True)
+        contracts_slot = st.empty()
+        if rows:
+            contracts_slot.dataframe(
+                pd.DataFrame(rows).style.format(
+                    {"MWh": "{:.2f}", "Cost (€)": "{:,.2f}", "Economie (€)": "{:,.2f}"}
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            contracts_slot.caption("Încă nu aveți contracte.")
+
+
+def _pop_toast() -> None:
+    msg = st.session_state.pop("toast_msg", None)
+    if msg:
+        st.toast(msg)
+
 
 # =====================================================================
-# AUTO-STEP CONTINUU ÎN RING BUFFER (FĂRĂ OPRIRE LA FINALUL DATELOR)
+# RUTARE PE ROLURI + AUTO-ACTUALIZARE (st.fragment rulează periodic doar zona live)
 # =====================================================================
-# Human-in-the-Loop: Live Feed-ul se oprește singur când o ofertă așteaptă decizia dispecerului.
-if st.session_state.autoplay:
-    paused_targets = st.session_state.setdefault("autopaused_targets", set())
-    new_targets = [h for h in sorted(pending_offers) if h not in paused_targets]
-    if new_targets:
-        # Pauză o singură dată per oră țintă nouă; la un nou Play, feed-ul poate trece mai departe
-        paused_targets.update(new_targets)
-        st.session_state.autoplay = False
-        st.toast(
-            f"⏸ Live Feed oprit: ofertă nouă pentru ora {_ring_dt(new_targets[0]).strftime('%H:%M')} "
-            "— ai 2 ore să o aprobi sau să o refuzi."
-        )
-        st.rerun()
-    else:
-        time.sleep(AUTOPLAY_SECONDS)
-        st.session_state.pending_advance = True
-        st.rerun()
+def _ppc_live() -> None:
+    _pop_toast()
+    compute_state()
+    render_ppc()
+
+
+def _dc_live() -> None:
+    _pop_toast()
+    compute_state()
+    render_dc(USER_DC)
+
+
+if ROLE == "ppc":
+    render_ppc_header()
+    # PPC vede automat răspunsurile DC-urilor (la 3s); în Play rulează oricum toată pagina
+    st.fragment(run_every=None if st.session_state.autoplay else "3s")(_ppc_live)()
+
+    # AUTO-STEP CONTINUU ÎN RING BUFFER (FĂRĂ OPRIRE LA FINALUL DATELOR)
+    # Human-in-the-Loop: Live Feed-ul se oprește singur când apare o ofertă nouă.
+    if st.session_state.autoplay:
+        paused_targets = st.session_state.setdefault("autopaused_targets", set())
+        new_targets = [h for h in sorted(pending_offers) if h not in paused_targets]
+        if new_targets:
+            # Pauză o singură dată per oră țintă nouă; la un nou Play, feed-ul poate trece mai departe
+            paused_targets.update(new_targets)
+            st.session_state.autoplay = False
+            st.toast(
+                f"⏸ Live Feed oprit: ofertă nouă pentru ora {_ring_dt(new_targets[0]).strftime('%H:%M')} "
+                "— e valabilă doar în ora curentă."
+            )
+            st.rerun()
+        else:
+            time.sleep(AUTOPLAY_SECONDS)
+            st.session_state.pending_advance = True
+            st.rerun()
+else:
+    # Data Center-ul vede ofertele noi automat (la 2s), fără să apese nimic
+    st.fragment(run_every="2s")(_dc_live)()
