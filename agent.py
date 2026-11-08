@@ -25,14 +25,16 @@ class VoltComputeAgent:
     1. perceive() -> Validare strictă a telemetriei cu Pydantic v2.
     2. estimate() -> Predicție surplus (MW), scor de confidență și explicații SHAP/atribuire.
     3. decide()   -> Aplicare reguli de siguranță (anomalii >3σ, confidență, protecție termică HVAC <= 26°C,
-                     prag de activare: surplus > 5 MW ȘI preț PZU < 25 EUR/MWh).
+                     prag de activare: orice depășire prezisă a liniei de 10 MW).
     4. act()      -> Formatare payload dispecerizare pentru integrarea cu SCADA / HPC.
     """
 
     CONFIDENCE_THRESHOLD: float = 0.75
     THERMAL_LIMIT_CELSIUS: float = 26.0       # Filtru siguranță termică HVAC: temp <= 26°C
-    MIN_SURPLUS_THRESHOLD_MW: float = 5.0     # Prag activare: surplus prezis > 5 MW
-    MAX_PZU_PRICE_EUR: float = 25.0           # ... ȘI preț PZU < 25 EUR/MWh
+    # Prag activare: ORICE depășire prezisă a liniei (> 0.1 MW peste limită) primește ofertă.
+    # Congestia liniei este fizică: surplusul peste limită nu poate fi injectat, oricare ar fi prețul PZU.
+    MIN_SURPLUS_THRESHOLD_MW: float = 0.1
+    # Oferta acoperă DOAR surplusul prezis (energia de peste linie); nu vindem energie de sub linie.
     FIXED_GREEN_PRICE_EUR: float = 30.0       # Tarif fix de arbitraj (nu scade la refuz)
     ANOMALY_SIGMA: float = 3.0                # Senzori > 3σ față de distribuția de antrenare -> UNCERTAIN
 
@@ -376,13 +378,8 @@ class VoltComputeAgent:
                 top_shap_features=top_shap_features,
             )
 
-        # Regula 3: Arbitraj activ: surplus > 5 MW ȘI preț PZU < 25 EUR/MWh
-        da_price = grid.day_ahead_price_eur if grid.day_ahead_price_eur is not None else 60.0
-        if (
-            surplus_predicted_mw > self.MIN_SURPLUS_THRESHOLD_MW
-            and da_price < self.MAX_PZU_PRICE_EUR
-            and center.max_absorb_capacity_mw > 0
-        ):
+        # Regula 3: Arbitraj activ la orice depășire prezisă a liniei
+        if surplus_predicted_mw > self.MIN_SURPLUS_THRESHOLD_MW and center.max_absorb_capacity_mw > 0:
             allocated_mw = min(surplus_predicted_mw, center.max_absorb_capacity_mw)
             return AgentDecision(
                 surplus_predicted_mw=surplus_predicted_mw,
@@ -391,8 +388,7 @@ class VoltComputeAgent:
                 allocated_mw=allocated_mw,
                 fixed_price_eur=self.FIXED_GREEN_PRICE_EUR,
                 reasoning=(
-                    f"Surplus solar critic detectat ({surplus_predicted_mw:.2f} MW peste limita de {grid.grid_capacity_limit_mw:.1f} MW, "
-                f"PZU {da_price:.1f} EUR/MWh < {self.MAX_PZU_PRICE_EUR:.0f}). "
+                    f"Surplus solar detectat ({surplus_predicted_mw:.2f} MW peste limita de {grid.grid_capacity_limit_mw:.1f} MW). "
                     f"S-a generat oferta automată de {allocated_mw:.2f} MW la tarif verde fix {self.FIXED_GREEN_PRICE_EUR:.0f} EUR/MWh "
                     f"către {center.center_id} ({center.pending_compute_jobs} joburi AI/HPC în așteptare, răcire optimă la {center.cooling_temp_celsius:.1f}°C)."
                 ),
@@ -407,8 +403,8 @@ class VoltComputeAgent:
             allocated_mw=0.0,
             fixed_price_eur=self.FIXED_GREEN_PRICE_EUR,
             reasoning=(
-                f"Fără arbitraj: surplus estimat {surplus_predicted_mw:.2f} MW, PZU {da_price:.1f} EUR/MWh "
-                f"(activare doar la surplus > {self.MIN_SURPLUS_THRESHOLD_MW:.0f} MW și PZU < {self.MAX_PZU_PRICE_EUR:.0f} EUR/MWh)."
+                f"Rețeaua PPC este sub limita liniei (surplus estimat {surplus_predicted_mw:.2f} MW). "
+                f"Nu este necesară redirecționarea."
             ),
             top_shap_features=top_shap_features,
         )

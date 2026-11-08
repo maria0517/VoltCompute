@@ -1,5 +1,5 @@
 {
-  "_comment": "Profilurile Data Center-elor + istoricul ofertelor folosit de routerul determinist (services/router.py). Istoricul de pornire (offers_sent / offers_accepted) este simulat pentru demo; în sesiune este actualizat la fiecare Aprobă / Refuză.",
+  "_comment": "Profilurile Data Center-elor + istoricul ofertelor folosit de routerul determinist (services/router.py). Istoricul pornește de la 0 oferte și este actualizat în sesiune la fiecare Aprobă / Refuză.",
   "fixed_tariff_eur_mwh": 30.0,
   "hvac_max_temp_c": 26.0,
   "datacenters": [
@@ -10,7 +10,10 @@
       "workload": "Antrenare LLM / GPU",
       "queue": 45,
       "color": "#00FF9D",
-      "history": {"offers_sent": 40, "offers_accepted": 34}
+      "history": {
+        "offers_sent": 0,
+        "offers_accepted": 0
+      }
     },
     {
       "id": "DC_CLOUD_CLUJ",
@@ -19,7 +22,10 @@
       "workload": "Randări / batch CPU",
       "queue": 20,
       "color": "#38BDF8",
-      "history": {"offers_sent": 40, "offers_accepted": 26}
+      "history": {
+        "offers_sent": 0,
+        "offers_accepted": 0
+      }
     },
     {
       "id": "DC_EDGE_TIMISOARA",
@@ -28,7 +34,10 @@
       "workload": "Backup-uri masive",
       "queue": 30,
       "color": "#FF4B4B",
-      "history": {"offers_sent": 40, "offers_accepted": 31}
+      "history": {
+        "offers_sent": 0,
+        "offers_accepted": 0
+      }
     }
   ]
 }

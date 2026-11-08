@@ -46,7 +46,7 @@ VoltCompute/
 3. **`decide()`** — reguli deterministe, fără al doilea model ML (evităm compunerea erorilor):
    - `confidence_score < 0.75` → `ESCALATE_TO_HUMAN`;
    - temperatura HVAC a DC-ului **> 26°C** → nod exclus (filtru siguranță termică);
-   - **surplus > 5 MW ȘI PZU < 25 EUR/MWh** → `OFFER_GENERATED` la **30 EUR/MWh**.
+   - **orice depășire prezisă a liniei de 10 MW** → `OFFER_GENERATED` la **30 EUR/MWh**, doar pentru surplusul prezis (oferta se oprește când estimarea ajunge la limita liniei; nu vindem energie de sub linie).
    - Clasament DC: `Score = 0.4·VolumFit + 0.4·RatăAcceptareIstorică − 0.2·PenalizareTermică`.
 4. **`act()`** — pool routing Human-in-the-Loop: oferta pleacă la primul clasat; la **Refuză** tariful **nu scade**, nodul devine inactiv și oferta sare la următorul DC la același preț; dacă refuză toți → **`ALL_DCS_EXHAUSTED`**. La **Aprobă** nodul trece în `COMPUTING`, iar surplusul scade pe grafic.
 
